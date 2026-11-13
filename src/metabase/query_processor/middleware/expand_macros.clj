@@ -1,167 +1,142 @@
 (ns metabase.query-processor.middleware.expand-macros
-  "Middleware for expanding `METRIC` and `SEGMENT` 'macros' in *unexpanded* MBQL queries.
+  "Middleware for expanding LEGACY `:segment` 'macros' in *unexpanded* MBQL queries.
 
-   Code in charge of expanding [\"METRIC\" ...] and [\"SEGMENT\" ...] forms in MBQL queries.
-   (METRIC forms are expanded into aggregations and sometimes filter clauses, while SEGMENT forms
-    are expanded into filter clauses.)
+  (`:segment` forms are expanded into filter clauses.)"
+  (:refer-clojure :exclude [mapv not-empty])
+  (:require
+   [metabase.lib.core :as lib]
+   [metabase.lib.filter :as lib.filter]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.lib.schema :as lib.schema]
+   [metabase.lib.schema.expression :as lib.schema.expression]
+   [metabase.lib.schema.metadata :as lib.schema.metadata]
+   [metabase.lib.walk :as lib.walk]
+   [metabase.query-processor.error-type :as qp.error-type]
+   [metabase.util :as u]
+   [metabase.util.i18n :refer [tru]]
+   [metabase.util.log :as log]
+   [metabase.util.malli :as mu]
+   [metabase.util.malli.registry :as mr]
+   [metabase.util.match :as match]
+   [metabase.util.performance :refer [mapv not-empty]]))
 
-   TODO - this namespace is ancient and written with MBQL '95 in mind, e.g. it is case-sensitive.
-   At some point this ought to be reworked to be case-insensitive and cleaned up."
-  (:require [clojure.tools.logging :as log]
-            [clojure.walk :as walk]
-            [metabase.models
-             [metric :refer [Metric]]
-             [segment :refer [Segment]]]
-            [metabase.query-processor
-             [interface :as i]
-             [util :as qputil]]
-            [metabase.util :as u]
-            [toucan.db :as db]))
+;;; "legacy macro" as used below means legacy Segment.
+(mr/def ::legacy-macro
+  ::lib.schema.metadata/segment)
 
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                                    UTIL FNS                                                    |
-;;; +----------------------------------------------------------------------------------------------------------------+
+(mr/def ::macro-type
+  [:enum :segment])
 
-(defn- is-clause? [clause-names object]
-  (and (sequential? object)
-       ((some-fn string? keyword?) (first object))
-       (contains? clause-names (qputil/normalize-token (first object)))))
+(mu/defn unresolved-legacy-macro-ids :- [:maybe [:set {:min 1} pos-int?]]
+  "Find all the unresolved :segment references in `query`.
 
-(defn- non-empty-clause? [clause]
-  (and clause
-       (or (not (sequential? clause))
-           (and (seq clause)
-                (not (every? nil? clause))))))
+  :segment references can appear anywhere a boolean expression is
+  allowed, including `:filters`, join conditions, expression aggregations like `:sum-where`, etc."
+  [macro-type :- ::macro-type
+   query      :- ::lib.schema/query]
+  (let [ids (volatile! (transient #{}))]
+    (lib.walk/walk-stages
+     query
+     (fn [_query _path stage]
+       (match/match-many stage
+         [#{macro-type} _opts (id :guard pos-int?)]
+         (vswap! ids conj! id))
+       nil))
+    (not-empty (persistent! @ids))))
 
+;;; a legacy Segment has one or more filter clauses.
 
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                                    SEGMENTS                                                    |
-;;; +----------------------------------------------------------------------------------------------------------------+
+(mu/defn- segment-definition->stage :- [:maybe ::lib.schema/stage.mbql]
+  "Extract the MBQL 5 stage from a segment definition. Segment definitions are always MBQL 5 queries at this point
+  (converted by the segment model's after-select hook), so we just extract the first stage."
+  [{:keys [definition], :as _legacy-macro} :- ::legacy-macro]
+  (log/trace "Extracting MBQL 5 stage from segment definition")
+  (first (:stages definition)))
 
-(defn- segment-parse-filter-subclause [form]
-  (when (non-empty-clause? form)
-    (if-not (is-clause? #{:segment} form)
-      form
-      (:filter (db/select-one-field :definition Segment :id (u/get-id (second form)))))))
+(mu/defn- legacy-macro-filters :- [:maybe [:sequential ::lib.schema.expression/boolean]]
+  "Get the filter(s) associated with a Segment."
+  [legacy-macro :- ::legacy-macro]
+  (mapv lib/fresh-uuids
+        (:filters (segment-definition->stage legacy-macro))))
 
-(defn- segment-parse-filter [form]
-  (when (non-empty-clause? form)
-    (if (is-clause? #{:and :or :not} form)
-      ;; for forms that start with AND/OR/NOT recursively parse the subclauses and put them nicely back into their
-      ;; compound form
-      (cons (first form) (mapv segment-parse-filter (rest form)))
-      ;; otherwise we should have a filter subclause so parse it as such
-      (segment-parse-filter-subclause form))))
+(mr/def ::id->legacy-macro
+  [:map-of pos-int? ::legacy-macro])
 
-(defn- expand-segments [query-dict]
-  (cond
-    (non-empty-clause? (get-in query-dict [:query :filter]))
-    (update-in query-dict [:query :filter] segment-parse-filter)
+(mu/defn- fetch-legacy-macros :- ::id->legacy-macro
+  [macro-type            :- ::macro-type
+   metadata-providerable :- ::lib.schema.metadata/metadata-providerable
+   legacy-macro-ids      :- [:maybe [:set {:min 1} pos-int?]]]
+  (let [metadata-type     (case macro-type ;; left in case we see a :metric here
+                            :segment :metadata/segment)]
+    (u/prog1 (into {}
+                   (map (juxt :id identity))
+                   (lib.metadata/bulk-metadata-or-throw metadata-providerable metadata-type legacy-macro-ids))
+      ;; make sure all the IDs exist.
+      (doseq [id legacy-macro-ids]
+        (or (get <> id)
+            (throw (ex-info (tru "Segment {0} does not exist, belongs to a different Database, or is invalid."
+                                 id)
+                            {:type qp.error-type/invalid-query, :macro-type macro-type, :id id})))))))
 
-    (non-empty-clause? (get-in query-dict [:query :source-query :filter]))
-    (update-in query-dict [:query :source-query :filter] segment-parse-filter)
+(defmulti ^:private resolve-legacy-macros-in-stage
+  {:arglists '([macro-type stage id->legacy-macro])}
+  (fn [macro-type _stage _id->legacy-macro]
+    macro-type))
 
-    :else
-    query-dict))
+(mu/defmethod resolve-legacy-macros-in-stage :segment :- ::lib.schema/stage
+  [_macro-type        :- [:= :segment]
+   stage              :- ::lib.schema/stage
+   id->legacy-segment :- ::id->legacy-macro]
+  (-> (match/replace stage
+        [:segment _opts (id :guard pos-int?)]
+        (let [legacy-segment (get id->legacy-segment id)
+              filter-clauses (legacy-macro-filters legacy-segment)]
+          (log/debugf "Expanding legacy Segment macro for Segment %d (%d filter clauses)" id (count filter-clauses))
+          ;; replace a single segment with a single filter, wrapping them in `:and` if needed... we will unwrap once
+          ;; we've expanded all of the :segment refs.
+          (if (> (count filter-clauses) 1)
+            (apply lib.filter/and filter-clauses)
+            (first filter-clauses))))
+      lib.filter/flatten-compound-filters-in-stage
+      lib.filter/remove-duplicate-filters-in-stage))
 
+(mu/defn- resolve-legacy-macros :- ::lib.schema/query
+  [macro-type       :- ::macro-type
+   query            :- ::lib.schema/query
+   legacy-macro-ids :- [:maybe [:set {:min 1} pos-int?]]]
+  (log/debugf "Resolving legacy %s macros with IDs %s" macro-type legacy-macro-ids)
+  (let [id->legacy-macro (fetch-legacy-macros macro-type query legacy-macro-ids)]
+    (lib.walk/walk-stages
+     query
+     (fn [_query _path stage]
+       (resolve-legacy-macros-in-stage macro-type stage id->legacy-macro)))))
 
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                                    METRICS                                                     |
-;;; +----------------------------------------------------------------------------------------------------------------+
+(mu/defn- expand-legacy-macros :- ::lib.schema/query
+  [macro-type :- ::macro-type
+   query      :- ::lib.schema/query]
+  (if-let [legacy-macro-ids (not-empty (unresolved-legacy-macro-ids macro-type query))]
+    (resolve-legacy-macros macro-type query legacy-macro-ids)
+    query))
 
-(defn- ga-metric?
-  "Is this metric clause not a Metabase Metric, but rather a GA one? E.g. something like [metric ga:users]. We want to
-   ignore those because they're not the same thing at all as MB Metrics and don't correspond to objects in our
-   application DB."
-  [[_ id]]
-  (boolean
-   (when ((some-fn string? keyword?) id)
-     (re-find #"^ga:" (name id)))))
+(def ^:private max-recursion-depth
+  "Detect infinite recursion for macro expansion."
+  50)
 
-(defn- metric? [aggregation]
-  (and (is-clause? #{:metric} aggregation)
-       (not (ga-metric? aggregation))))
+(mu/defn expand-macros
+  "Middleware that looks for `:segment` macros in an unexpanded MBQL query and substitute the macros for
+  their contents."
+  ([query  :- ::lib.schema/query]
+   (expand-macros query 0))
 
-(defn- metric-id [metric]
-  (when (metric? metric)
-    (u/get-id (second metric))))
-
-(defn- maybe-unnest-ag-clause
-  "Unnest AG-CLAUSE if it's wrapped in a vector (i.e. if it is using the \"multiple-aggregation\" syntax).
-   (This is provided merely as a convenience to facilitate implementation of the Query Builder, so it can use the same
-   UI for normal aggregations and Metric creation. *METRICS DO NOT SUPPORT MULTIPLE AGGREGATIONS,* so if nested syntax
-   is used, any aggregation after the first will be ignored.)"
-  [ag-clause]
-  (if (and (coll? ag-clause)
-           (every? coll? ag-clause))
-    (first ag-clause)
-    ag-clause))
-
-(defn- expand-metric [metric-clause filter-clauses-atom]
-  (let [{filter-clause :filter, ag-clause :aggregation} (db/select-one-field :definition Metric
-                                                          :id (metric-id metric-clause))]
-    (when filter-clause
-      (swap! filter-clauses-atom conj filter-clause))
-    (maybe-unnest-ag-clause ag-clause)))
-
-(defn- expand-metrics-in-ag-clause [query-dict filter-clauses-atom]
-  (walk/postwalk
-   (fn [form]
-     (if-not (metric? form)
-       form
-       (expand-metric form filter-clauses-atom)))
-   query-dict))
-
-(defn- merge-filter-clauses [base-clause additional-clauses]
-  (cond
-    (and (seq base-clause)
-         (seq additional-clauses)) [:and base-clause additional-clauses]
-    (seq base-clause)              base-clause
-    (seq additional-clauses)       additional-clauses
-    :else                          []))
-
-(defn- add-metrics-filter-clauses
-  "Add any FILTER-CLAUSES to the QUERY-DICT. If query has existing filter clauses, the new ones are
-   combined with an `:and` filter clause."
-  [query-dict filter-clauses]
-  (if-not (seq filter-clauses)
-    query-dict
-    (update-in query-dict [:query :filter] merge-filter-clauses (if (> (count filter-clauses) 1)
-                                                                  (cons :and filter-clauses)
-                                                                  (first filter-clauses)))))
-
-(defn- expand-metrics* [query-dict]
-  (let [filter-clauses-atom (atom [])
-        query-dict          (expand-metrics-in-ag-clause query-dict filter-clauses-atom)]
-    (add-metrics-filter-clauses query-dict @filter-clauses-atom)))
-
-(defn- expand-metrics [{{aggregations :aggregation} :query, :as query-dict}]
-  (if-not (seq aggregations)
-    ;; :aggregation is empty, so no METRIC to expand
-    query-dict
-    ;; otherwise walk the query dict and expand METRIC clauses
-    (expand-metrics* query-dict)))
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                                   MIDDLEWARE                                                   |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(defn- expand-metrics-and-segments "Expand the macros (SEGMENT, METRIC) in a QUERY."
-  [query]
-  (-> query
-      expand-metrics
-      expand-segments))
-
-
-(defn- expand-macros* [query]
-  (if-not (qputil/mbql-query? query)
-    query
-    (u/prog1 (expand-metrics-and-segments query)
-      (when (and (not i/*disable-qp-logging*)
-                 (not= <> query))
-        (log/debug (u/format-color 'cyan "\n\nMACRO/SUBSTITUTED: %s\n%s" (u/emoji "😻") (u/pprint-to-str <>)))))))
-
-(defn expand-macros
-  "Middleware that looks for `METRIC` and `SEGMENT` macros in an unexpanded MBQL query and substitute the macros for their contents."
-  [qp] (comp qp expand-macros*))
+  ([query :- ::lib.schema/query recursion-depth :- :int]
+   (when (> recursion-depth max-recursion-depth)
+     (throw (ex-info (tru "Segment expansion failed. Check mutually recursive segment definitions.")
+                     {:type qp.error-type/invalid-query, :query query})))
+   (let [query' (expand-legacy-macros :segment query)]
+     ;; if we expanded anything, we need to recursively try expanding again until nothing is left to expand, in case a
+     ;; Segment references another Segment.
+     (if-not (= query' query)
+       (recur query' (inc recursion-depth))
+       (do
+         (log/trace "No more legacy Segments to expand.")
+         query')))))

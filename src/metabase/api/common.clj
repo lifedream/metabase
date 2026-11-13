@@ -1,52 +1,169 @@
+;; # API Endpoints at Metabase
+;;
+;; We use a custom macro called `defendpoint` for defining all endpoints. It's best illustrated with an example:
+;;
+;; <pre><code>
+;; (ns metabase.dashboards-rest.api ...)
+;;
+;; (api/defendpoint :get "/"
+;;  "Get `Dashboards`. With filter option `f`..."
+;;  [f]
+;;  {f [:maybe [:enum "all" "mine" "archived"]]}
+;;  (let ...))
+;;
+;;  ; ...
+;;
+;;
+;; </code></pre>
+;;
+;; As you can see, the arguments are:
+;;
+;; * **The HTTP verb.**  (`GET`, `PUT`, `POST`, etc)
+;; * **The route.** This will automatically have `api` and the namespace prefixed to it, so in this case `"/"` is defining
+;;   the route for `/api/dashboard/`.
+;; * **A docstring.** Apart from being helpful to us, this is used for API documentation for third-party devs, so please
+;;   be thorough!
+;; * **A schema.** This uses [Malli's vector syntax](https://github.com/metosin/malli#vector-syntax). This is documented
+;;   on Malli's page, of course, but we also have some of our own schemas defined. Start by looking in
+;;   [`metabase.util.malli.schema`](#metabase.util.malli.schema)
+;; * **The parameters.** This uses Compojure's
+;;   [destructuring syntax](https://github.com/weavejester/compojure/wiki/Destructuring-Syntax) (a superset of Clojure's
+;;   normal destructuring syntax).
+;; * **The actual code for the endpoint.** The returned value could be one of several types. The Right Thing (such as
+;;   converting to JSON or setting an appropriate status code) usually happens by default. Consult
+;;   [Compojure's documentation](https://github.com/weavejester/compojure/blob/master/src/compojure/response.clj),
+;;   but it may be more instructive to look at examples in our codebase.
+;;
+;;  <hr />
+;;
+;; ## How does defendpoint coercion work?
+;;
+;; The `defendpoint` macro uses the schemas to generate code which binds args to their decoded values. Values are
+;; decoded by their corresponding malli schema. n.b.: Only symbols in the arg->schema map will be coerced; unmentioned
+;; aliases will not be bound.
+;;
+;; The exact coercion function [[mc/decode]], uses the [[metabase.api.macros/decode-transformer]],
+;; and gets called with the schema, value, and transformer. see: https://github.com/metosin/malli#value-transformation
+;; for more details
+;;
+;; ### Here's an example repl session showing how it works:
+;;
+;; <pre><code>
+;;
+;; (require '[malli.core :as mc] '[malli.error :as me] '[malli.util :as mut] '[metabase.util.malli :as mu]
+;;          '[metabase.util.malli.describe :as umd] '[malli.provider :as mp] '[malli.generator :as mg]
+;;          '[malli.transform :as mtx] '[metabase.api.macros :as api.macros])
+;; </code></pre>
+;;
+;; To see how a schema will be transformed, call `mc/decode` with `api.macros/decode-transformer`.
+;;
+;; With the `:keyword` schema:
+;;
+;; <pre><code>
+;; (mc/decode :keyword "foo/bar" @#'api.macros/decode-transformer)
+;; ;; => :foo/bar
+;; </code></pre>
+;;
+;; The schemas can get quite complex, ( see: https://github.com/metosin/malli#advanced-transformations ) so it's best
+;; to test them out in the REPL to see how they'll be transformed.
+;;
+;; Example:
+;; <pre><code>
+;; (def DecodableKwInt
+;;   [:int {:decode/string (fn kw-int->int-decoder [kw-int]
+;;                           (if (int? kw-int) kw-int (parse-long (name kw-int))))}])
+;;
+;; (mc/decode DecodableKwInt :123 @#'metabase.api.macros/decode-transformer)
+;; ;; => 123
+;; </code></pre>
+;; <hr />
+
 (ns metabase.api.common
   "Dynamic variables and utility functions/macros for writing API functions."
-  (:require [cheshire.core :as json]
-            [clojure.string :as s]
-            [clojure.tools.logging :as log]
-            [compojure.core :refer [defroutes]]
-            [medley.core :as m]
-            [metabase
-             [public-settings :as public-settings]
-             [util :as u]]
-            [metabase.api.common.internal :refer :all]
-            [metabase.models.interface :as mi]
-            [ring.util
-             [io :as rui]
-             [response :as rr]]
-            [toucan.db :as db])
-  (:import [java.io BufferedWriter OutputStream OutputStreamWriter]
-           [java.nio.charset Charset StandardCharsets]))
+  (:require
+   [metabase.api.db :as api.db]
+   [metabase.api.open-api :as open-api]
+   [metabase.events.core :as events]
+   [metabase.models.interface :as mi]
+   [metabase.util :as u]
+   [metabase.util.api-error :as api-error]
+   [metabase.util.i18n :as i18n :refer [deferred-tru tru]]
+   [metabase.util.log :as log]
+   [metabase.util.malli :as mu]
+   [metabase.util.malli.registry :as mr]
+   [metabase.util.malli.schema :as ms]
+   [potemkin :as p]))
 
 (declare check-403 check-404)
+
+;; p/import-vars needs the literal ns symbol; the open-api alias won't resolve inside the macro
+#_{:clj-kondo/ignore [:aliased-namespace-symbol]}
+(p/import-vars [metabase.api.open-api root-open-api-object])
 
 ;;; ----------------------------------------------- DYNAMIC VARIABLES ------------------------------------------------
 ;; These get bound by middleware for each HTTP request.
 
+;;; TODO -- move this to [[metabase.request.current]]
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
 (def ^:dynamic ^Integer *current-user-id*
   "Int ID or `nil` of user associated with current API call."
   nil)
 
+;;; TODO -- move this to [[metabase.request.current]]
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
 (def ^:dynamic *current-user*
   "Delay that returns the `User` (or nil) associated with the current API call.
    ex. `@*current-user*`"
   (atom nil)) ; default binding is just something that will return nil when dereferenced
 
+;;; TODO -- move this to [[metabase.request.current]]
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
 (def ^:dynamic ^Boolean *is-superuser?*
   "Is the current user a superuser?"
   false)
 
+;;; TODO -- move this to [[metabase.request.current]]
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
+(def ^:dynamic ^Boolean *is-group-manager?*
+  "Is the current user a group manager of at least one group?"
+  false)
+
+;;; TODO -- move this to [[metabase.request.current]]
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
+(def ^:dynamic ^Boolean *is-data-analyst?*
+  "Is the current user a data analyst with access to Data Studio?"
+  false)
+
+;;; TODO -- move this to [[metabase.request.current]]
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
 (def ^:dynamic *current-user-permissions-set*
-  "Delay to the set of permissions granted to the current user."
+  "Delay to the set of permissions granted to the current user. See documentation in [[metabase.permissions.models.permissions]] for
+  more information about the Metabase permissions system."
   (atom #{}))
 
+(defn current-user-attributes
+  "Returns the attributes that can be used for DB routing, sandboxing, impersonation, etc."
+  []
+  (:attributes @*current-user*))
 
 ;;; ---------------------------------------- Precondition checking helper fns ----------------------------------------
 
+(defn- check-one [condition code message]
+  (when-not condition
+    (let [[message info] (if (and (map? message)
+                                  (not (i18n/localized-string? message)))
+                           [(:message message) message]
+                           [message])]
+      ;; a map message is authored as the response body, so all of it is client-facing
+      (throw (ex-info (str message)
+                      (apply api-error/extend-response-keys (assoc info :status-code code) (keys info))))))
+  condition)
+
 (defn check
   "Assertion mechanism for use inside API functions.
-  Checks that TEST is true, or throws an `ExceptionInfo` with STATUS-CODE and MESSAGE.
+  Checks that `test` is true, or throws an `ExceptionInfo` with `status-code` and `message`.
 
-  MESSAGE can be either a plain string error message, or a map including the key `:message` and any additional
+  `message` can be either a plain string error message, or a map including the key `:message` and any additional
   details, such as an `:error_code`.
 
   This exception is automatically caught in the body of `defendpoint` functions, and the appropriate HTTP response is
@@ -64,30 +181,54 @@
 
     (check test1 code1 message1
            test2 code2 message2)"
-  {:style/indent 1}
-  ([tst code-or-code-message-pair & rest-args]
-   (let [[[code message] rest-args] (if (vector? code-or-code-message-pair)
-                                      [code-or-code-message-pair rest-args]
-                                      [[code-or-code-message-pair (first rest-args)] (rest rest-args)])]
-     (when-not tst
-       (throw (if (map? message)
-                (ex-info (:message message) (assoc message :status-code code))
-                (ex-info message            {:status-code code}))))
-     (if (empty? rest-args) tst
-         (recur (first rest-args) (second rest-args) (drop 2 rest-args))))))
+  {:style/indent [:form], :arglists '([condition [code message] & more] [condition code message & more])}
+  [condition & args]
+  (let [[code message & more] (if (sequential? (first args))
+                                (concat (first args) (rest args))
+                                args)]
+    (check-one condition code message)
+    (if (seq more)
+      (recur (first more) (rest more))
+      condition)))
 
 (defn check-exists?
   "Check that object with ID (or other key/values) exists in the DB, or throw a 404."
   ([entity id]
    (check-exists? entity :id id))
   ([entity k v & more]
-   (check-404 (apply db/exists? entity k v more))))
+   (check-404 (apply api.db/entity-exists? entity k v more))))
 
 (defn check-superuser
   "Check that `*current-user*` is a superuser or throw a 403. This doesn't require a DB call."
   []
   (check-403 *is-superuser?*))
 
+(defn is-data-analyst?
+  "Whether the current user is a superuser or a member of the Data Analysts group, regardless of whether the
+  `advanced-permissions` feature is available. See [[entitled-data-analyst?]]."
+  []
+  ;; role membership only: the capabilities the permissions graph renders survive the loss of the feature
+  (or *is-superuser?* *is-data-analyst?*))
+
+(defn- advanced-permissions-enabled?
+  []
+  ;; resolved late: metabase.premium-features loads on top of this namespace
+  ((requiring-resolve 'metabase.premium-features.core/enable-advanced-permissions?)))
+
+(defn entitled-data-analyst?
+  "Whether the current user is a superuser, or a member of the Data Analysts group while the `advanced-permissions`
+  feature is available."
+  []
+  ;; capabilities that appear in no permissions graph pause on downgrade, so they key off this rather than
+  ;; [[is-data-analyst?]]
+  (or *is-superuser?*
+      (and *is-data-analyst?*
+           (advanced-permissions-enabled?))))
+
+(defn check-data-studio-access
+  "Check that `*current-user*` may enter Data Studio, or throw a 403."
+  []
+  (check-403 (entitled-data-analyst?)))
 
 ;; checkp- functions: as in "check param". These functions expect that you pass a symbol so they can throw exceptions
 ;; w/ relevant error messages.
@@ -95,13 +236,13 @@
 (defn throw-invalid-param-exception
   "Throw an `ExceptionInfo` that contains information about an invalid API params in the expected format."
   [field-name message]
-  (throw (ex-info (format "Invalid field: %s" field-name)
-           {:status-code 400
-            :errors      {(keyword field-name) message}})))
+  (throw (ex-info (tru "Invalid field: {0}" field-name)
+                  {:status-code 400
+                   :errors      {(keyword field-name) message}})))
 
 (defn checkp
   "Assertion mechanism for use inside API functions that validates individual input params.
-  Checks that TEST is true, or throws an `ExceptionInfo` with FIELD-NAME and MESSAGE.
+  Checks that `test` is true, or throws an `ExceptionInfo` with `field-name` and `message`.
 
   This exception is automatically caught in the body of `defendpoint` functions, and the appropriate HTTP response is
   generated.
@@ -109,44 +250,9 @@
   `checkp` can be called with the form
 
       (checkp test field-name message)"
-  {:style/indent 1}
-  ([tst field-name message]
-   (when-not tst
-     (throw-invalid-param-exception (str field-name) message))))
-
-(defn checkp-with
-  "Check (F VALUE), or throw an exception with STATUS-CODE (default is 400).
-   SYMB is passed in order to give the user a relevant error message about which parameter was bad.
-
-   Returns VALUE upon success.
-
-    (checkp-with (partial? contains? {:all :mine}) f :all)
-      -> :all
-    (checkp-with (partial? contains {:all :mine}) f :bad)
-      -> ExceptionInfo: Invalid value ':bad' for 'f': test failed: (partial? contains?) {:all :mine}
-
-   You may optionally pass a MESSAGE to append to the exception upon failure;
-   this will be used in place of the \"test failed: ...\" message.
-
-   MESSAGE may be either a string or a pair like `[status-code message]`."
-  ([f symb value]
-   (checkp-with f symb value (str "test failed: " f)))
-  ([f symb value message]
-   {:pre [(symbol? symb)]}
-   (checkp (f value) symb (format "Invalid value '%s' for '%s': %s" (str value) symb message))
-   value))
-
-(defn checkp-contains?
-  "Check that the VALUE of parameter SYMB is in VALID-VALUES, or throw a 400.
-   Returns VALUE upon success.
-
-    (checkp-contains? #{:fav :all :mine} 'f f)
-    -> (check (contains? #{:fav :all :mine} f)
-         [400 (str \"Invalid value '\" f \"' for 'f': must be one of: #{:fav :all :mine}\")])"
-  [valid-values-set symb value]
-  {:pre [(set? valid-values-set) (symbol? symb)]}
-  (checkp-with (partial contains? valid-values-set) symb value (str "must be one of: " valid-values-set)))
-
+  [tst field-name message]
+  (when-not tst
+    (throw-invalid-param-exception (str field-name) message)))
 
 ;;; ---------------------------------------------- api-let, api->, etc. ----------------------------------------------
 
@@ -157,197 +263,424 @@
 ;;
 ;;     (let [binding x] ...) -> (api-let [500 \"Not OK!\"] [binding x] ...)
 
-(defmacro api-let
-  "If TEST is true, bind it to BINDING and evaluate BODY.
+(defmacro do-api-let
+  "If `test` is true, bind it to `binding` and evaluate `body`. Intended for internal use only by macros such as
+  `let-400` below.
 
     (api-let [404 \"Not found.\"] [user @*current-user*]
       (:id user))"
-  {:arglists '([[status-code message] [binding test] & body]), :style/indent 2}
-  [response-pair [binding test & more] & body]
-  (if (seq more)
-    `(api-let ~response-pair ~[binding test]
-       (api-let ~response-pair ~more
-         ~@body))
-    `(let [test# ~test] ; bind ~test so doesn't get evaluated more than once (e.g. in case it's an expensive funcall)
-       (check test# ~response-pair)
-       (let [~binding test#
-             ~@more]
-         ~@body))))
-
+  [response-pair bindings & body]
+  ;; so `response-pair` doesn't get evaluated more than once
+  (let [response-pair-symb (gensym "response-pair-")]
+    `(let [~response-pair-symb ~response-pair
+           ~@(vec (apply concat (for [[binding test] (partition-all 2 bindings)]
+                                  [binding `(check ~test ~response-pair-symb)])))]
+       ~@body)))
 
 ;;; ### GENERIC RESPONSE HELPERS
 ;; These are basically the same as the `api-` versions but with RESPONSE-PAIR already bound
 
-;; #### GENERIC 400 RESPONSE HELPERS
-(def ^:private generic-400
-  [400 "Invalid Request."])
-
 (defn check-400
-  "Throw a `400` if ARG is `false` or `nil`, otherwise return as-is."
-  [arg]
-  (check arg generic-400))
+  "Throw a `400` if `arg` is `false` or `nil`, otherwise return as-is."
+  ([arg]
+   (check-400 arg (deferred-tru "Invalid Request.")))
+  ([arg msg]
+   (check arg [400 msg])))
 
-(defmacro let-400
-  "Bind a form as with `let`; throw a 400 if it is `nil` or `false`."
-  {:style/indent 1}
-  [& body]
-  `(api-let ~generic-400 ~@body))
+(defn check-no-dropped-entries
+  "Throw a 400 when request decoding dropped entries from a map whose keys are not declared. `raw` is the map as the
+  client sent it, taken from the request body; `decoded` is the map the endpoint received. The request decoder removes
+  an entry of such a map whose key or value does not fit the schema instead of rejecting the request, so an endpoint
+  that must not silently ignore a bad entry compares the two."
+  [raw decoded]
+  (check-400 (or (not (map? raw)) (= (count raw) (count decoded)))
+             (tru "The request contains keys or values this endpoint does not accept.")))
 
 ;; #### GENERIC 404 RESPONSE HELPERS
 (def ^:private generic-404
-  [404 "Not found."])
+  [404 (deferred-tru "Not found.")])
 
 (defn check-404
-  "Throw a `404` if ARG is `false` or `nil`, otherwise return as-is."
-  [arg]
-  (check arg generic-404))
+  "Throw a `404` if `arg` is `false` or `nil`, otherwise return as-is."
+  ([arg]
+   (check arg generic-404))
+  ([arg msg]
+   (check arg [404 msg])))
 
 (defmacro let-404
   "Bind a form as with `let`; throw a 404 if it is `nil` or `false`."
   {:style/indent 1}
-  [& body]
-  `(api-let ~generic-404 ~@body))
+  [bindings & body]
+  `(do-api-let ~generic-404 ~bindings ~@body))
 
 ;; #### GENERIC 403 RESPONSE HELPERS
 ;; If you can't be bothered to write a custom error message
-(def ^:private generic-403
-  [403 "You don't have permissions to do that."])
+(defn- generic-403 []
+  [403 (tru "You don''t have permissions to do that.")])
 
 (defn check-403
-  "Throw a `403` if ARG is `false` or `nil`, otherwise return as-is."
+  "Throw a `403` (no permissions) if `arg` is `false` or `nil`, otherwise return as-is."
   [arg]
-  (check arg generic-403))
-(defmacro let-403
-  "Bind a form as with `let`; throw a 403 if it is `nil` or `false`."
-  {:style/indent 1}
-  [& body]
-  `(api-let ~generic-403 ~@body))
+  (check arg (generic-403)))
+
+(defn throw-403
+  "Throw a generic 403 (no permissions) error response."
+  ([]
+   (throw-403 nil))
+
+  ([e]
+   (throw (ex-info (tru "You don''t have permissions to do that.") {:status-code 403} e))))
 
 ;; #### GENERIC 500 RESPONSE HELPERS
 ;; For when you don't feel like writing something useful
 (def ^:private generic-500
-  [500 "Internal server error."])
+  [500 (deferred-tru "Internal server error.")])
 
 (defn check-500
-  "Throw a `500` if ARG is `false` or `nil`, otherwise return as-is."
+  "Throw a `500` if `arg` is `false` or `nil`, otherwise return as-is."
   [arg]
   (check arg generic-500))
 
-(defmacro let-500
-  "Bind a form as with `let`; throw a 500 if it is `nil` or `false`."
-  {:style/indent 1}
-  [& body]
-  `(api-let   ~generic-500 ~@body))
-
-(def ^:const generic-204-no-content
+;;; TODO -- why does this live here but other 'generic' responses live in [[metabase.request.util]]. We should move this
+;;; so it lives with its friends
+(def generic-204-no-content
   "A 'No Content' response for `DELETE` endpoints to return."
   {:status 204, :body nil})
 
+(mr/def ::generic-204-no-content
+  "Response schema for an endpoint that returns [[generic-204-no-content]].
+  OpenAPI documents it as a 204 response with no body, rather than as the Ring response map."
+  [:map {:closed true, :openapi/response {:status "204", :description "No content"}}
+   [:status [:= 204]]
+   [:body   :nil]])
 
-;;; --------------------------------------- DEFENDPOINT AND RELATED FUNCTIONS ----------------------------------------
+(defn +check-superuser
+  "Wrap a Ring handler to make sure the current user is a superuser before handling any requests.
 
-;; TODO - several of the things `defendpoint` does could and should just be done by custom Ring middleware instead
-(defmacro defendpoint
-  "Define an API function.
-   This automatically does several things:
-
-   -  calls `auto-parse` to automatically parse certain args. e.g. `id` is converted from `String` to `Integer` via
-      `Integer/parseInt`
-   -  converts ROUTE from a simple form like `\"/:id\"` to a typed one like `[\"/:id\" :id #\"[0-9]+\"]`
-   -  sequentially applies specified annotation functions on args to validate them.
-   -  executes BODY inside a `try-catch` block that handles exceptions; if exception is an instance of `ExceptionInfo`
-      and includes a `:status-code`, that code will be returned
-   -  automatically calls `wrap-response-if-needed` on the result of BODY
-   -  tags function's metadata in a way that subsequent calls to `define-routes` (see below)
-      will automatically include the function in the generated `defroutes` form.
-   -  Generates a super-sophisticated Markdown-formatted docstring"
-  {:arglists '([method route docstr? args schemas-map? & body])}
-  [method route & more]
-  {:pre [(or (string? route)
-             (vector? route))]}
-  (let [fn-name                (route-fn-name method route)
-        route                  (typify-route route)
-        [docstr [args & more]] (u/optional string? more)
-        [arg->schema body]     (u/optional #(and (map? %) (every? symbol? (keys %))) more)
-        validate-param-calls   (validate-params arg->schema)]
-    (when-not docstr
-      (log/warn (format "Warning: endpoint %s/%s does not have a docstring." (ns-name *ns*) fn-name)))
-    `(def ~(vary-meta fn-name assoc
-                      ;; eval the vals in arg->schema to make sure the actual schemas are resolved so we can document
-                      ;; their API error messages
-                      :doc (route-dox method route docstr args (m/map-vals eval arg->schema) body)
-                      :is-endpoint? true)
-       (~method ~route ~args
-        (catch-api-exceptions
-          (auto-parse ~args
-            ~@validate-param-calls
-            (wrap-response-if-needed (do ~@body))))))))
-
-
-(defmacro define-routes
-  "Create a `(defroutes routes ...)` form that automatically includes all functions created with
-   `defendpoint` in the current namespace."
-  [& additional-routes]
-  (let [api-routes (for [[symb varr] (ns-publics *ns*)
-                         :when       (:is-endpoint? (meta varr))]
-                     symb)]
-    `(defroutes ~(vary-meta 'routes assoc :doc (format "Ring routes for %s:\n%s"
-                                                       (-> (ns-name *ns*)
-                                                           (s/replace #"^metabase\." "")
-                                                           (s/replace #"\." "/"))
-                                                       (u/pprint-to-str (concat api-routes additional-routes))))
-       ~@additional-routes ~@api-routes)))
-
+    (api/+check-superuser routes)"
+  [handler]
+  (open-api/handler-with-open-api-spec
+   (fn [request respond raise]
+     (if-let [e (try
+                  (check-superuser)
+                  nil
+                  (catch Throwable e
+                    e))]
+       (raise e)
+       (handler request respond raise)))
+   (fn [prefix]
+     (open-api/open-api-spec handler prefix))))
 
 ;;; ---------------------------------------- PERMISSIONS CHECKING HELPER FNS -----------------------------------------
 
 (defn read-check
-  "Check whether we can read an existing OBJ, or ENTITY with ID.
-   If the object doesn't exist, throw a 404; if we don't have proper permissions, throw a 403.
-   This will fetch the object if it was not already fetched, and returns OBJ if the check is successful."
-  {:style/indent 2}
+  "Check whether we can read an existing `obj`, or `entity` with `id`. If the object doesn't exist, throw a 404; if we
+  don't have proper permissions, throw a 403. This will fetch the object if it was not already fetched, and returns
+  `obj` if the check is successful."
   ([obj]
    (check-404 obj)
-   (check-403 (mi/can-read? obj))
+   (try
+     (check-403 (mi/can-read? obj))
+     (catch clojure.lang.ExceptionInfo e
+       (log/errorf "Read permissions failure: %s" (ex-message e))
+       (events/publish-event! :event/read-permission-failure {:user-id    *current-user-id*
+                                                              :object     obj
+                                                              :has-access false})
+       (throw e)))
    obj)
+
   ([entity id]
-   (read-check (entity id)))
+   (read-check (api.db/entity-by-id entity id)))
+
   ([entity id & other-conditions]
-   (read-check (apply db/select-one entity :id id other-conditions))))
+   (read-check (apply api.db/entity-by-id entity id other-conditions))))
 
 (defn write-check
-  "Check whether we can write an existing OBJ, or ENTITY with ID.
-   If the object doesn't exist, throw a 404; if we don't have proper permissions, throw a 403.
-   This will fetch the object if it was not already fetched, and returns OBJ if the check is successful."
-  {:style/indent 2}
+  "Check whether we can write an existing `obj`, or `entity` with `id`. If the object doesn't exist, throw a 404; if we
+  don't have proper permissions, throw a 403. This will fetch the object if it was not already fetched, and returns
+  `obj` if the check is successful."
   ([obj]
    (check-404 obj)
-   (check-403 (mi/can-write? obj))
+   (try
+     (check-403 (mi/can-write? obj))
+     (catch clojure.lang.ExceptionInfo e
+       (events/publish-event! :event/write-permission-failure {:user-id *current-user-id*
+                                                               :object obj})
+       (throw e)))
    obj)
   ([entity id]
-   (write-check (entity id)))
+   (write-check (api.db/entity-by-id entity id)))
   ([entity id & other-conditions]
-   (write-check (apply db/select-one entity :id id other-conditions))))
+   (write-check (apply api.db/entity-by-id entity id other-conditions))))
 
+(defn query-check
+  "Check whether we can query an existing `obj`, or `entity` with `id`. If the object doesn't exist, throw a 404; if we
+  don't have query permissions, throw a 403. This is separate from [[read-check]] - for data model entities like
+  Tables and Databases, `query-check` means 'can execute queries against' while `read-check` means 'can see metadata'.
+  This will fetch the object if it was not already fetched, and returns `obj` if the check is successful."
+  ([obj]
+   (check-404 obj)
+   (try
+     (check-403 (mi/can-query? obj))
+     (catch clojure.lang.ExceptionInfo e
+       (events/publish-event! :event/read-permission-failure {:user-id *current-user-id*
+                                                              :object  obj})
+       (throw e)))
+   obj)
+  ([entity id]
+   (query-check (api.db/entity-by-id entity id)))
+  ([entity id & other-conditions]
+   (query-check (apply api.db/entity-by-id entity id other-conditions))))
+
+(defn create-check
+  "NEW! Check whether the current user has permissions to CREATE a new instance of an object with properties in map `m`.
+
+  This function was added *years* after `read-check` and `write-check`, and at the time of this writing most models do
+  not implement this method. Most `POST` API endpoints instead have the `can-create?` logic for a given model
+  hardcoded into them -- this should be considered an antipattern and be refactored out going forward."
+  {:added "0.32.0"}
+  [model entity]
+  (try
+    (check-403 (mi/can-create? model entity))
+    (catch clojure.lang.ExceptionInfo e
+      (events/publish-event! :event/create-permission-failure {:model   model
+                                                               :user-id *current-user-id*})
+      (throw e))))
+
+(defn update-check
+  "NEW! Check whether the current user has permissions to UPDATE an object by applying a map of `changes`.
+
+  This function was added *years* after `read-check` and `write-check`, and at the time of this writing most models do
+  not implement this method. Most `PUT` API endpoints instead have the `can-update?` logic for a given model hardcoded
+  into them -- this should be considered an antipattern and be refactored out going forward."
+  {:added "0.36.0"}
+  [instance changes]
+  (try
+    (check-403 (mi/can-update? instance changes))
+    (catch clojure.lang.ExceptionInfo e
+      (events/publish-event! :event/update-permission-failure {:user-id *current-user-id*
+                                                               :object instance})
+      (throw e))))
 
 ;;; ------------------------------------------------ OTHER HELPER FNS ------------------------------------------------
 
-(defn check-public-sharing-enabled
-  "Check that the `public-sharing-enabled` Setting is `true`, or throw a `400`."
-  []
-  (check (public-settings/enable-public-sharing)
-    [400 "Public sharing is not enabled."]))
-
-(defn check-embedding-enabled
-  "Is embedding of Cards or Objects (secured access via `/api/embed` endpoints with a signed JWT enabled?"
-  []
-  (check (public-settings/enable-embedding)
-    [400 "Embedding is not enabled."]))
-
 (defn check-not-archived
-  "Check that the OBJECT exists and is not `:archived`, or throw a `404`. Returns OBJECT as-is if check passes."
+  "Check that the `object` exists and is not `:archived`, or throw a `404`. Returns `object` as-is if check passes."
   [object]
   (u/prog1 object
     (check-404 object)
     (check (not (:archived object))
-      [404 {:message "The object has been archived.", :error_code "archived"}])))
+           [404 {:message (tru "The object has been archived."), :error_code "archived"}])))
+
+(defn check-valid-page-params
+  "Check on paginated stuff that, if the limit exists, the offset exists, and vice versa."
+  [limit offset]
+  (check (not (and limit (not offset))) [400 (tru "When including a limit, an offset must also be included.")])
+  (check (not (and offset (not limit))) [400 (tru "When including an offset, a limit must also be included.")]))
+
+(def ^:private ColumnValue
+  "One value of a column compared by `column-will-change?`."
+  [:maybe [:or :string :int :boolean :keyword
+           :metabase.queries.schema/card.dataset-query
+           :metabase.queries.schema/card.result-metadata
+           ms/EmbeddingParams]])
+
+(mu/defn column-will-change? :- :boolean
+  "Helper for PATCH-style operations to see if a column is set to change when `after` (the column's value in the
+  input to the endpoint, or `::not-provided` when the column is absent from that input) is applied.
+
+    ;; assuming we have a Collection 10, that is not currently archived...
+    (api/column-will-change? false true) ; -> true, because value will change
+
+    (api/column-will-change? false false) ; -> false, because value did not change
+
+    (api/column-will-change? false ::not-provided) ; -> false; value not specified in updates (request body)"
+  [before :- ColumnValue
+   after  :- [:or ColumnValue [:= ::not-provided]]]
+  (boolean
+   (and (not= after ::not-provided)
+        (not= before after))))
+
+;;; ------------------------------------------ COLLECTION POSITION HELPER FNS ----------------------------------------
+
+(mu/defn reconcile-position-for-collection!
+  "Compare `old-position` and `new-position` to determine what needs to be updated based on the position change. Used
+  for fixing card/dashboard/pulse changes that impact other instances in the collection"
+  [collection-id :- [:maybe ms/PositiveInt]
+   old-position  :- [:maybe ms/PositiveInt]
+   new-position  :- [:maybe ms/PositiveInt]]
+  (when (not= new-position old-position)
+    (cond
+      (and (nil? new-position)
+           old-position)
+      (doseq [shift-after! [api.db/shift-card-positions-after! api.db/shift-dashboard-positions-after!
+                            api.db/shift-pulse-positions-after! api.db/shift-document-positions-after!]]
+        (shift-after! collection-id old-position :-))
+
+      (and new-position (nil? old-position))
+      (doseq [shift-from! [api.db/shift-card-positions-from! api.db/shift-dashboard-positions-from!
+                           api.db/shift-pulse-positions-from! api.db/shift-document-positions-from!]]
+        (shift-from! collection-id new-position :+))
+
+      (> new-position old-position)
+      (doseq [shift-between! [api.db/shift-card-positions-between! api.db/shift-dashboard-positions-between!
+                              api.db/shift-pulse-positions-between! api.db/shift-document-positions-between!]]
+        (shift-between! collection-id old-position new-position :-))
+
+      (< new-position old-position)
+      (doseq [shift-between! [api.db/shift-card-positions-between! api.db/shift-dashboard-positions-between!
+                              api.db/shift-pulse-positions-between! api.db/shift-document-positions-between!]]
+        (shift-between! collection-id new-position old-position :+)))))
+
+(def ^:private ModelWithPosition
+  "Intended to cover Cards/Dashboards/Pulses, it only asserts collection id and position, allowing extra keys"
+  [:map {:closed true}
+   [:collection_id       [:maybe ms/PositiveInt]]
+   [:collection_position [:maybe ms/PositiveInt]]])
+
+(def ^:private ModelWithOptionalPosition
+  "Intended to cover Cards/Dashboards/Pulses updates. Collection id and position are optional, if they are not
+  present, they didn't change. If they are present, they might have changed and we need to compare."
+  [:map {:closed true}
+   [:collection_id       {:optional true} [:maybe ms/PositiveInt]]
+   [:collection_position {:optional true} [:maybe ms/PositiveInt]]])
+
+(mu/defn maybe-reconcile-collection-position!
+  "Generic function for working on cards/dashboards/pulses. Checks the before and after changes to see if there is any
+  impact to the collection position of that model instance. If so, executes updates to fix the collection position
+  that goes with the change. The 2-arg version of this function is used for a new card/dashboard/pulse (i.e. not
+  updating an existing instance, but creating a new one)."
+  ([new-model-data :- ModelWithOptionalPosition]
+   (maybe-reconcile-collection-position! nil new-model-data))
+  ([{old-collection-id :collection_id, old-position :collection_position, :as _before-update} :- [:maybe ModelWithPosition]
+    {new-collection-id :collection_id, new-position :collection_position, :as model-updates} :- ModelWithOptionalPosition]
+   (let [updated-collection? (and (contains? model-updates :collection_id)
+                                  (not= old-collection-id new-collection-id))
+         updated-position?   (and (contains? model-updates :collection_position)
+                                  (not= old-position new-position))]
+     (cond
+       ;; If the collection hasn't changed, but we have a new collection position, we might need to reconcile
+       (and (not updated-collection?) updated-position?)
+       (reconcile-position-for-collection! old-collection-id old-position new-position)
+
+       ;; If we have a new collection id, but no new position, reconcile the old collection, then update the new
+       ;; collection with the existing position
+       (and updated-collection? (not updated-position?))
+       (do
+         (reconcile-position-for-collection! old-collection-id old-position nil)
+         (reconcile-position-for-collection! new-collection-id nil old-position))
+
+       ;; We have a new collection id AND and new collection position
+       ;; Update the old collection using the old position
+       ;; Update the new collection using the new position
+       (and updated-collection? updated-position?)
+       (do
+         (reconcile-position-for-collection! old-collection-id old-position nil)
+         (reconcile-position-for-collection! new-collection-id nil new-position))))))
+
+;;; ------------------------------------------ PARAM PARSING FNS ----------------------------------------
+
+(defn bit->boolean
+  "Coerce a bit returned by some MySQL/MariaDB versions in some situations to Boolean.
+
+  MariaDB is especially strange: https://stackoverflow.com/questions/78466426/bit1-in-view-using-conditionals-in-mariadb-returns-48-49"
+  [v]
+  (cond
+    (number? v)                      (not (zero? v))
+    (and (bytes? v) (= (count v) 1)) (case (char (first v))
+                                       \0 false
+                                       \1 true)
+    :else                            v))
+
+(defn parse-multi-values-param
+  "Parse a param that could have a single value or multiple values using `parse-fn`.
+  Always return a vector.
+
+  Used for API that can parse single value or multiple values for a param:
+  e.g:
+    single value: api/card/series?exclude_ids=1
+    multi values: api/card/series?exclude_ids=1&exclude_ids=2
+
+  Example usage:
+    (parse-multi-values-param \"1\" parse-long)
+    => [1]
+
+    (parse-multi-values-param [\"1\" \"2\"] parse-long)
+    => [1, 2]"
+  [xs parse-fn]
+  (if (sequential? xs)
+    (map parse-fn xs)
+    [(parse-fn xs)]))
+
+;;; ---------------------------------------- SET `archived_directly` ---------------------------------
+
+(defn updates-with-archived-directly
+  "Sets `archived_directly` to `true` iff `:archived` is being set to `true`."
+  [current-obj obj-updates]
+  (cond-> obj-updates
+    (column-will-change? (:archived current-obj) (get obj-updates :archived ::not-provided))
+    (assoc :archived_directly (boolean (:archived obj-updates)))
+
+    ;; This is a hack around a frontend issue. Apparently, the undo functionality depends on calculating a diff
+    ;; between the current state and the previous state. Sometimes this results in the frontend telling us to
+    ;; *both* mark an item as archived *and* "move" it to the Trash.
+    ;;
+    ;; Let's just say that if you're marking something as archived, we throw away any `collection_id` you passed in
+    ;; along with it.
+    (and (column-will-change? (:archived current-obj) (get obj-updates :archived ::not-provided))
+         (:archived obj-updates))
+    (dissoc :collection_id)))
+
+(defn present-in-trash-if-archived-directly
+  "If `:archived_directly` is `true`, set `:collection_id` to the trash collection ID."
+  [item trash-collection-id]
+  (cond-> item
+    (:archived_directly item)
+    (assoc :collection_id trash-collection-id)))
+
+(mu/defn present-items
+  "A convenience function that takes a heterogeneous collection of items. Each item should have, at minimum, a `:model`
+  and an `:id`. The `f` function is called like `(f model all-items-with-that-model)` and should return a collection
+  of maps. `:id` is the only required key for these maps, and order *does not matter* - `present-items` is responsible
+  for reordering items the way they were."
+  [f :- ifn?
+   items :- [:sequential [:map {:closed true}
+                          [:id ms/PositiveInt]
+                          [:model :keyword]]]]
+  (let [id+model->order (into {} (map-indexed (fn [i row] [[(:id row) (:model row)] i]) items))]
+    (->> items
+         (group-by :model)
+         (mapcat (fn [[model items]]
+                   (map #(assoc % ::model model) (f model items))))
+         (sort-by (comp id+model->order (juxt :id ::model)))
+         (map #(dissoc % ::model)))))
+
+(def model->db-model
+  ;; NOTE search is decoupling itself from this mapping, favoring a self-contained spec in search.spec/define-spec
+  ;; Once search.legacy is gone, this dependency should be gone as well.
+  "A mapping from the name of a model used in the API to information about it. This is reused in search, and entity_id
+  translation."
+  {"action"            {:db-model :model/Action             :alias :action}
+   "card"              {:db-model :model/Card               :alias :card}
+   "collection"        {:db-model :model/Collection         :alias :collection}
+   "dashboard"         {:db-model :model/Dashboard          :alias :dashboard}
+   "database"          {:db-model :model/Database           :alias :database}
+   "dataset"           {:db-model :model/Card               :alias :card}
+   "document"          {:db-model :model/Document           :alias :document}
+   "exploration"       {:db-model :model/Exploration        :alias :exploration}
+   "indexed-entity"    {:db-model :model/ModelIndexValue    :alias :model-index-value}
+   "metric"            {:db-model :model/Card               :alias :card}
+   "segment"           {:db-model :model/Segment            :alias :segment}
+   "measure"           {:db-model :model/Measure            :alias :measure}
+   "snippet"           {:db-model :model/NativeQuerySnippet :alias :snippet}
+   "table"             {:db-model :model/Table              :alias :table}
+   "dashboard-card"    {:db-model :model/DashboardCard      :alias :dashboard-card}
+   "dashboard-tab"     {:db-model :model/DashboardTab       :alias :dashboard-tab}
+   "dimension"         {:db-model :model/Dimension          :alias :dimension}
+   "permissions-group" {:db-model :model/PermissionsGroup   :alias :permissions-group}
+   "pulse"             {:db-model :model/Pulse              :alias :pulse}
+   "pulse-card"        {:db-model :model/PulseCard          :alias :pulse-card}
+   "pulse-channel"     {:db-model :model/PulseChannel       :alias :pulse-channel}
+   "timeline"          {:db-model :model/Timeline           :alias :timeline}
+   "transform"         {:db-model :model/Transform          :alias :transform}
+   "user"              {:db-model :model/User               :alias :user}})

@@ -1,159 +1,206 @@
 (ns metabase.query-processor.middleware.permissions
   "Middleware for checking that the current user has permissions to run the current query."
-  (:require [clojure.tools.logging :as log]
-            [honeysql.core :as hsql]
-            [metabase.api.common :refer [*current-user-id* *current-user-permissions-set*]]
-            [metabase.models.permissions :as perms]
-            [metabase.util :as u]
-            [metabase.util.honeysql-extensions :as hx]
-            [toucan.db :as db]))
+  (:require
+   [metabase.api.common :refer [*current-user-id* *current-user-permissions-set*]]
+   [metabase.audit-app.core :as audit]
+   [metabase.lib.core :as lib]
+   [metabase.lib.metadata.protocols :as lib.metadata.protocols]
+   [metabase.lib.schema :as lib.schema]
+   [metabase.permissions.core :as perms]
+   [metabase.premium-features.core :refer [defenterprise]]
+   [metabase.query-permissions.core :as query-perms]
+   [metabase.query-processor.error-type :as qp.error-type]
+   [metabase.query-processor.schema :as qp.schema]
+   ;; the legacy QP pipeline still conveys the metadata provider via the ambient store; no MBQL 5 path yet
+   ^{:clj-kondo/ignore [:deprecated-namespace]} [metabase.query-processor.store :as qp.store]
+   [metabase.query-processor.util :as qp.util]
+   [metabase.util.i18n :refer [tru]]
+   [metabase.util.log :as log]
+   [metabase.util.malli :as mu]))
 
-;;; ------------------------------------------------------------ Helper Fns ------------------------------------------------------------
+(set! *warn-on-reflection* true)
 
-(defn- log-permissions-debug-message {:style/indent 2} [color format-str & format-args]
-  (let [appropriate-lock-emoji (if (= color 'yellow)
-                                 "🔒"   ; lock (closed)
-                                 "🔓")] ; lock (open
-    (log/debug (u/format-color color (apply format (format "Permissions Check %s : %s" appropriate-lock-emoji format-str) format-args)))))
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
+(def ^:dynamic *card-id*
+  "ID of the Card currently being executed, if there is one. Bind this in a Card-execution so we will use
+  Card [Collection] perms checking rather than ad-hoc perms checking."
+  nil)
 
-(defn- log-permissions-success-message {:style/indent 1} [format-string & format-args]
-  (log-permissions-debug-message 'green (str "Yes ✅  " (apply format format-string format-args))))
+(defenterprise check-block-permissions
+  "OSS implementation always returns `nil` because block permissions are an EE-only feature."
+  metabase-enterprise.advanced-permissions.models.permissions.block-permissions
+  [_query])
 
-;; DEPRECATED because to use this function we need to have an actual `Permissions` object instead of being able to use *current-user-permissions-set*.
-;; Use `log-permissions-success-message` instead.
-(defn- ^:deprecated log-permissions-success [user-id permissions]
-  (log-permissions-success-message "because User %d is a member of Group %d (%s) which has permissions for '%s'"
-    user-id
-    (:group_id permissions)
-    (db/select-one-field :name 'PermissionsGroup :id (:group_id permissions))
-    (:object permissions)))
+(defn- throw-inactive-table-error
+  [{db-id :id db-name :name} {table-id :id table-name :name schema :schema}]
+  ;; We don't cache perms for inactive tables, so we need to manually bypass the cache here
+  (perms/disable-perms-cache
+    (let [show-table-name? (perms/user-has-permission-for-table? *current-user-id*
+                                                                 :perms/view-data
+                                                                 :unrestricted
+                                                                 db-id
+                                                                 table-id)]
+      (throw (Exception. (tru "Table {0} is inactive." (if show-table-name?
+                                                         (format "\"%s.%s.%s\"" db-name schema table-name)
+                                                         table-id)))))))
 
-(defn- log-permissions-error []
-  (log/warn (u/format-color 'red "Permissions Check 🔐 : No 🚫"))) ; lock (closed)
+(defn- check-query-does-not-access-inactive-tables
+  "Throws an exception if any of the tables referenced by this query are marked as inactive in the app DB.
+  These queries would (likely) fail anyway since an inactive table one is either deleted, or Metabase's connection
+  doesn't have access to it. But we can reject them preemptively for a more consistent experience, and to avoid
+  needing to cache permissions for inactive tables."
+  [{database-id :database, :as outer-query}]
+  (qp.store/with-metadata-provider database-id
+    (let [table-ids (query-perms/query->source-table-ids outer-query)]
+      (doseq [table-id table-ids]
+        (let [table (lib.metadata.protocols/table (qp.store/metadata-provider) table-id)]
+          (when-not (:active table)
+            (throw-inactive-table-error (lib.metadata.protocols/database (qp.store/metadata-provider))
+                                        table)))))))
 
-;; TODO - what status code / error message should we use when someone doesn't have permissions?
-(defn- throw-permissions-exception [format-str & format-args]
-  (log-permissions-error)
-  (throw (Exception. ^String (apply format format-str format-args))))
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
+(def ^:dynamic *param-values-query*
+  "Used to allow users looking at a dashboard to view (possibly chained) filters."
+  false)
 
-;; DEPRECATED because we should just check it the "new" way instead: (perms/set-has-full-permissions? @*current-user-permissions-set* object-path)
-(defn- ^:deprecated permissions-for-object
-  "Return the first `Permissions` entry for USER-ID that grants permissions to OBJECT-PATH."
-  [user-id object-path]
-  {:pre [(integer? user-id) (perms/valid-object-path? object-path)]}
-  (u/prog1 (db/select-one 'Permissions
-             {:where [:and [:in :group_id (db/select-field :group_id 'PermissionsGroupMembership :user_id user-id)]
-                           [:like object-path (hx/concat :object (hx/literal "%"))]]})
-    (when <>
-      (log-permissions-success user-id <>))))
+(defenterprise check-audit-db-permissions
+  "OSS implementation always throws an exception since queries over the audit DB are not permitted."
+  metabase-enterprise.audit-app.permissions
+  [query]
+  (throw (ex-info (tru "Querying this database requires the audit-app feature flag")
+                  {:type qp.error-type/disabled-feature, :query query})))
 
+(mu/defn check-query-permissions*
+  "Check that User with `user-id` has permissions to run `query`, or throw an exception."
+  [query :- ::qp.schema/any-query]
+  (if (:lib/type query)
+    (recur (lib/->legacy-MBQL query))
+    (let [{database-id :database :as outer-query} query]
+      (when (and (= audit/audit-db-id database-id)
+                 (or (qp.util/userland-query? outer-query)
+                     *param-values-query*
+                     *current-user-id*))
+        (check-audit-db-permissions outer-query))
+      (when *current-user-id*
+        (log/tracef "Checking query permissions. Current user permissions = %s"
+                    (pr-str (perms/permissions-for-user *current-user-id*)))
+        (check-query-does-not-access-inactive-tables outer-query)
+        (let [required-perms  (query-perms/required-perms-for-query outer-query :already-preprocessed? true)
+              source-card-ids (:card-ids required-perms)]
+          ;; On EE, check block permissions up front for all queries. If block perms are in place, reject all native queries
+          ;; (unless overridden by `gtap-perms`) and any queries that touch blocked tables/DBs
+          (check-block-permissions outer-query)
+          (cond
+            ;; if card-id is bound this means that this is not an ad hoc query and we can just
+            ;; check that the user has permission to read this card
+            *card-id*
+            (do (query-perms/check-card-read-perms database-id *card-id*)
+                (query-perms/check-card-result-metadata-data-perms database-id *card-id*)
+                (when-not (query-perms/has-perm-for-query? outer-query :perms/view-data required-perms)
+                  (throw (query-perms/perms-exception required-perms)))
+                (doseq [card-id source-card-ids
+                        :when  (not= card-id *card-id*)]
+                  (query-perms/check-card-read-perms database-id card-id)
+                  (query-perms/check-card-result-metadata-data-perms database-id card-id)))
 
-;;; ------------------------------------------------------------ Permissions for MBQL queries ------------------------------------------------------------
+            ;; set when querying for field values of dashboard filters, which only require
+            ;; collection perms for the dashboard and not ad-hoc query perms
+            *param-values-query*
+            (do
+              ;; `source-card-ids` holds the Card the values query is built on as well as every Card its query nests,
+              ;; and the user must be able to read all of them, just like when running the Card normally. Otherwise a
+              ;; readable wrapper Card launders the values of a Card the user cannot read. Don't narrow this to the
+              ;; nested Cards: filter values from field-ref-only dashcard mappings have no caller-side read check on
+              ;; the mapped Card, so this is the only check. The result_metadata check covers tables a Card's saved
+              ;; columns name but its query footprint does not.
+              (doseq [card-id source-card-ids]
+                (query-perms/check-card-read-perms database-id card-id)
+                (query-perms/check-card-result-metadata-data-perms database-id card-id))
+              (when-not (query-perms/has-perm-for-query? outer-query :perms/view-data required-perms)
+                (throw (query-perms/perms-exception required-perms))))
 
-;; TODO - All of this below should be rewritten to use `*current-user-permissions-set*` and `metabase.models.card/query-perms-set` instead.
-;; The functions that need to be reworked are marked DEPRECATED below.
-
-(defn- ^:deprecated user-can-run-query-referencing-table?
-  "Does User with USER-ID have appropriate permissions to run an MBQL query referencing table with TABLE-ID?"
-  [user-id table-id]
-  {:pre [(integer? user-id) (integer? table-id)]}
-  (let [{:keys [schema database-id]} (db/select-one ['Table [:db_id :database-id] :schema] :id table-id)]
-    (permissions-for-object user-id (perms/object-path database-id schema table-id))))
-
-
-(defn- ^:deprecated table-id [source-or-join-table]
-  {:post [(integer? %)]}
-  (or (:id source-or-join-table)
-      (:table-id source-or-join-table)))
-
-(defn- ^:deprecated table-identifier ^String [source-or-join-table]
-  (name (hsql/qualify (:schema source-or-join-table) (or (:name source-or-join-table)
-                                                         (:table-name source-or-join-table)))))
-
-
-(defn- ^:deprecated throw-if-cannot-run-query-referencing-table [user-id table]
-  (log-permissions-debug-message 'yellow "Can User %d access Table %d (%s)?" user-id (table-id table) (table-identifier table))
-  (or (user-can-run-query-referencing-table? user-id (table-id table))
-      (throw-permissions-exception "You do not have permissions to run queries referencing table '%s'." (table-identifier table))))
-
-;; TODO - why is this the only function here that takes `user-id`?
-(defn- throw-if-cannot-run-query
-  "Throw an exception if USER-ID doesn't have permissions to run QUERY."
-  [user-id {:keys [source-table join-tables source-query]}]
-  (if source-query
-    (recur user-id source-query)
-    (doseq [table (cons source-table join-tables)]
-      (throw-if-cannot-run-query-referencing-table user-id table))))
-
-
-;;; ------------------------------------------------------------ Permissions for Native Queries ------------------------------------------------------------
-
-(defn- throw-if-user-doesnt-have-permissions-for-path
-  "Check whether current user has permissions for OBJECT-PATH, and throw an exception if not.
-   Log messages related to the permissions checks as well."
-  [object-path]
-  (log-permissions-debug-message 'yellow "Does user have permissions for %s?" object-path)
-  (when-not (perms/set-has-full-permissions? @*current-user-permissions-set* object-path)
-    (throw-permissions-exception "You do not have read permissions for %s." object-path))
-  ;; permissions check out, now log which perms we've been granted that allowed our escapades to proceed
-  (log-permissions-success-message "because user has permissions for %s." (some (fn [permissions-path]
-                                                                                  (when (perms/is-permissions-for-object? permissions-path object-path)
-                                                                                    permissions-path))
-                                                                                @*current-user-permissions-set*)))
-
-(defn throw-if-cannot-run-new-native-query-referencing-db
-  "Throw an exception if User with USER-ID doesn't have native query *readwrite* permissions for DATABASE."
-  [database-or-id]
-  (throw-if-user-doesnt-have-permissions-for-path (perms/native-readwrite-path (u/get-id database-or-id))))
-
-(defn- ^:deprecated throw-if-cannot-run-existing-native-query-referencing-db
-  "Throw an exception if User with USER-ID doesn't have native query *read* permissions for DATABASE.
-   (DEPRECATED because native read permissions are being eliminated in favor of Collection permissions.)"
-  [database-or-id]
-  (throw-if-user-doesnt-have-permissions-for-path (perms/native-read-path (u/get-id database-or-id))))
-
-(defn- throw-if-user-doesnt-have-access-to-collection
-  "Throw an exception if the current User doesn't have permissions to run a Card that is part of COLLECTION."
-  [collection-id]
-  (throw-if-user-doesnt-have-permissions-for-path (perms/collection-read-path collection-id)))
-
-
-;;; ------------------------------------------------------------ Middleware ------------------------------------------------------------
-
-(defn- check-query-permissions-for-user
-  "Check that User with USER-ID has permissions to run QUERY, or throw an exception."
-  [user-id {query-type :type, database :database, {:keys [source-query], :as query} :query, {:keys [card-id]} :info, :as outer-query}]
-  {:pre [(integer? user-id) (map? outer-query)]}
-  (let [native?       (= (keyword query-type) :native)
-        collection-id (db/select-one-field :collection_id 'Card :id card-id)]
-    (cond
-      ;; if the card is in a COLLECTION, then see if the current user has permissions for that collection
-      collection-id
-      (throw-if-user-doesnt-have-access-to-collection collection-id)
-      ;; Otherwise if this is a NESTED query then we should check permissions for the source query
-      source-query
-      (if (:native source-query)
-        (throw-if-cannot-run-existing-native-query-referencing-db database)
-        (throw-if-cannot-run-query user-id source-query))
-      ;; for native queries that are *not* part of an existing card, check that we have native permissions for the DB
-      (and native? (not card-id))
-      (throw-if-cannot-run-new-native-query-referencing-db database)
-      ;; for native queries that *are* part of an existing card, just check if the have native read permissions (DEPRECATED)
-      native?
-      (throw-if-cannot-run-existing-native-query-referencing-db database)
-      ;; for MBQL queries (existing card or not), check that we can run against the source-table. and each of the join-tables, if any
-      (not native?)
-      (throw-if-cannot-run-query user-id query))))
-
-(defn- check-query-permissions* [query]
-  (u/prog1 query
-    (when *current-user-id*
-      (check-query-permissions-for-user *current-user-id* query))))
+            ;; Ad-hoc query (not a saved question)
+            :else
+            (do
+              ;; Check that we permissions for any source cards first, then check that we have requisite data permissions
+              ;; Recursively check permissions for any source Cards
+              (doseq [card-id source-card-ids]
+                (query-perms/check-card-read-perms database-id card-id))
+              ;; Check that we have the data permissions to run this card
+              (query-perms/check-data-perms outer-query required-perms :throw-exceptions? true)
+              ;; Check that all columns from source cards result_metadata are accessible
+              (doseq [card-id source-card-ids]
+                (query-perms/check-card-result-metadata-data-perms database-id card-id))
+              ;; Recursively check permissions for any Cards referenced by this query via template tags
+              (doseq [{query :dataset-query} (lib/template-tags-referenced-cards
+                                              (lib/query (qp.store/metadata-provider) outer-query))]
+                (check-query-permissions* query)))))))))
 
 (defn check-query-permissions
-  "Middleware that check that the current user has permissions to run the current query.
-   This only applies if `*current-user-id*` is bound. In other cases, like when running
-   public Cards or sending pulses, permissions need to be checked separately before allowing
-   the relevant objects to be create (e.g., when saving a new Pulse or 'publishing' a Card)."
+  "Middleware that check that the current user has permissions to run the current query. This only applies if
+  `*current-user-id*` is bound. In other cases, like when running public Cards or sending pulses, permissions need to
+  be checked separately before allowing the relevant objects to be create (e.g., when saving a new Pulse or
+  'publishing' a Card)."
   [qp]
-  (comp qp check-query-permissions*))
+  (fn [query rff]
+    (check-query-permissions* query)
+    (qp query rff)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                Writeback fns                                                   |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defn- check-no-sandboxed-action-access
+  "Throws a 403 when the current user has a sandbox on any table of the Database with `database-id`, since actions
+  write around sandboxes."
+  [database-id]
+  (when (and *current-user-id* (perms/sandboxed-user-for-db? database-id))
+    (throw (ex-info (tru "You can''t run actions on this database because row and column security applies to your data access.")
+                    {:type        qp.error-type/missing-required-permissions
+                     :status-code 403}))))
+
+(mu/defn check-query-action-permissions*
+  "Throws unless the current user can run an action with the already preprocessed `query`."
+  [{database-id :database, :as query} :- ::lib.schema/query]
+  (log/tracef "Checking query permissions. Current user perms set = %s" (pr-str @*current-user-permissions-set*))
+  (check-no-sandboxed-action-access database-id)
+  (when *card-id*
+    (query-perms/check-card-read-perms database-id *card-id*))
+  (when-not (query-perms/check-data-perms
+             query
+             (query-perms/required-perms-for-query query :already-preprocessed? true)
+             :throw-exceptions? false)
+    (check-block-permissions query)))
+
+(mu/defn check-query-action-permissions :- ::qp.schema/qp
+  "Middleware that check that the current user has permissions to run the current query action."
+  [qp :- ::qp.schema/qp]
+  (mu/fn [query :- ::lib.schema/native-only-query
+          rff   :- ::qp.schema/rff]
+    (check-query-action-permissions* query)
+    (qp query rff)))
+
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                            Non-middleware util fns                                             |
+;;; +----------------------------------------------------------------------------------------------------------------+
+
+(defn current-user-has-adhoc-native-query-perms?
+  "If current user is bound, do they have ad-hoc native query permissions for `query`'s database? (This is used by
+  [[metabase.query-processor.compile/compile]] and
+  the [[metabase.query-processor.middleware.catch-exceptions/catch-exceptions]] middleware to check the user should be
+  allowed to see the native query before converting the MBQL query to native.)"
+  [{database-id :database, :as _query}]
+  (or
+   (not *current-user-id*)
+   (and (= (perms/full-database-permission-for-user *current-user-id* :perms/create-queries database-id)
+           :query-builder-and-native)
+        ;; the compiled SQL of a sandboxed user's query exposes the sandbox definition
+        (not (perms/sandboxed-user-for-db? database-id)))))
+
+(defn check-current-user-has-adhoc-native-query-perms
+  "Check that the current user (if bound) has adhoc native query permissions to run `query`, or throw an
+  Exception. (This is used by the `POST /api/dataset/native` endpoint to check perms before converting an MBQL query
+  to native.)"
+  [{database-id :database, :as query}]
+  (when-not (current-user-has-adhoc-native-query-perms? query)
+    (throw (query-perms/perms-exception {database-id {:perms/create-queries :query-builder-and-native}}))))

@@ -1,186 +1,206 @@
 (ns metabase.query-processor.middleware.expand-macros-test
-  (:require [expectations :refer :all]
-            [metabase
-             [query-processor :as qp]
-             [query-processor-test :refer :all]
-             [util :as u]]
-            [metabase.models
-             [database :refer [Database]]
-             [metric :refer [Metric]]
-             [segment :refer [Segment]]
-             [table :refer [Table]]]
-            [metabase.query-processor.middleware
-             [expand :as ql]
-             [expand-macros :as expand-macros :refer :all]]
-            [metabase.test.data :as data]
-            [metabase.test.data.datasets :as datasets]
-            [toucan.util.test :as tt]))
+  (:require
+   [clojure.test :refer :all]
+   [metabase.lib.convert :as lib.convert]
+   [metabase.lib.core :as lib]
+   [metabase.lib.filter :as lib.filter]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.lib.query :as lib.query]
+   [metabase.lib.test-metadata :as meta]
+   [metabase.lib.test-util :as lib.tu]
+   [metabase.lib.test-util.macros :as lib.tu.macros]
+   [metabase.query-processor.middleware.expand-macros :as expand-macros]
+   ;; binds mock metadata providers via the ambient store, which the code under test reads
+   ^{:clj-kondo/ignore [:deprecated-namespace]} [metabase.query-processor.store :as qp.store]))
 
-;; no Segment or Metric should yield exact same query
-(expect
-  {:database 1
-   :type     :query
-   :query    {:aggregation ["rows"]
-              :filter      ["AND" [">" 4 1]]
-              :breakout    [17]}}
-  (#'expand-macros/expand-metrics-and-segments {:database 1
-                                                :type     :query
-                                                :query    {:aggregation ["rows"]
-                                                           :filter      ["AND" [">" 4 1]]
-                                                           :breakout    [17]}}))
+(defn- expand-macros
+  "If input is a legacy query, convert to MBQL 5, call [[expand-macros/expand-macros]], then convert back to legacy. This
+  way we don't need to update all the tests below right away."
+  [query]
+  (if (:type query) ; legacy query
+    (let [metadata-provider (if (qp.store/initialized?)
+                              (qp.store/metadata-provider)
+                              meta/metadata-provider)]
+      (-> (lib.query/query metadata-provider query)
+          (#'expand-macros/expand-macros)
+          lib.convert/->legacy-MBQL))
+    (#'expand-macros/expand-macros query)))
 
-;; just segments
-(expect
-  {:database 1
-   :type     :query
-   :query    {:aggregation ["rows"]
-              :filter      ["AND" ["AND" ["=" 5 "abc"]]
-                            ["OR" ["AND" ["IS_NULL" 7]]
-                             [">" 4 1]]]
-              :breakout    [17]}}
-  (tt/with-temp* [Database [{database-id :id}]
-                  Table    [{table-id :id}     {:db_id database-id}]
-                  Segment  [{segment-1-id :id} {:table_id   table-id
-                                                :definition {:filter ["AND" ["=" 5 "abc"]]}}]
-                  Segment  [{segment-2-id :id} {:table_id   table-id
-                                                :definition {:filter ["AND" ["IS_NULL" 7]]}}]]
-    (#'expand-macros/expand-metrics-and-segments {:database 1
-                                                  :type     :query
-                                                  :query    {:aggregation ["rows"]
-                                                             :filter      ["AND" ["SEGMENT" segment-1-id] ["OR" ["SEGMENT" segment-2-id] [">" 4 1]]]
-                                                             :breakout    [17]}})))
+(deftest ^:parallel basic-expansion-test
+  (testing "no Segment should yield exact same query"
+    (is (=? (lib.tu.macros/mbql-query venues
+              {:filter   [:> $price 1]
+               :breakout [$category-id]})
+            (expand-macros
+             (lib.tu.macros/mbql-query venues
+               {:filter   [:> $price 1]
+                :breakout [$category-id]}))))))
 
-;; Does expansion work if "AND" isn't capitalized? (MBQL is case-insensitive!) (#5706, #5530)
-(expect
-  {:database 1
-   :type     :query
-   :query    {:aggregation ["rows"]
-              :filter      ["and"
-                            ["=" 5 "abc"]
-                            ["IS_NULL" 7]]
-              :breakout    [17]}}
-  (tt/with-temp* [Database [{database-id :id}]
-                  Table    [{table-id :id}     {:db_id database-id}]
-                  Segment  [{segment-1-id :id} {:table_id   table-id
-                                                :definition {:filter ["=" 5 "abc"]}}]
-                  Segment  [{segment-2-id :id} {:table_id   table-id
-                                                :definition {:filter ["IS_NULL" 7]}}]]
-    (#'expand-macros/expand-metrics-and-segments {:database 1
-                                                  :type     :query
-                                                  :query    {:aggregation ["rows"]
-                                                             :filter      ["and"
-                                                                           ["SEGMENT" segment-1-id]
-                                                                           ["SEGMENT" segment-2-id]]
-                                                             :breakout    [17]}})))
+(def ^:private mock-metadata-provider
+  (lib.tu/mock-metadata-provider
+   meta/metadata-provider
+   {:segments [{:id         1
+                :name       "Segment 1"
+                :table-id   (meta/id :venues)
+                :definition (-> (lib.query/query meta/metadata-provider (meta/table-metadata :venues))
+                                (lib/filter (lib/= (meta/field-metadata :venues :name) "abc")))}
+               {:id         2
+                :name       "Segment 2"
+                :table-id   (meta/id :venues)
+                :definition (-> (lib.query/query meta/metadata-provider (meta/table-metadata :venues))
+                                (lib/filter (lib/is-null (meta/field-metadata :venues :category-id))))}]}))
 
-;; just a metric (w/out nested segments)
-(expect
-  {:database 1
-   :type     :query
-   :query    {:aggregation ["count"]
-              :filter      [:and
-                            ["AND" [">" 4 1]]
-                            ["AND" ["=" 5 "abc"]]]
-              :breakout    [17]
-              :order_by    [[1 "ASC"]]}}
-  (tt/with-temp* [Database [{database-id :id}]
-                  Table    [{table-id :id}    {:db_id database-id}]
-                  Metric   [{metric-1-id :id} {:table_id   table-id
-                                               :definition {:aggregation ["count"]
-                                                            :filter      ["AND" ["=" 5 "abc"]]}}]]
-    (#'expand-macros/expand-metrics-and-segments {:database 1
-                                                  :type     :query
-                                                  :query    {:aggregation ["METRIC" metric-1-id]
-                                                             :filter      ["AND" [">" 4 1]]
-                                                             :breakout    [17]
-                                                             :order_by    [[1 "ASC"]]}})))
+(deftest ^:parallel segments-test
+  (qp.store/with-metadata-provider mock-metadata-provider
+    (is (=? {:database (meta/id)
+             :type :query
+             :query {:source-table (meta/id :venues)
+                     :breakout [[:field (meta/id :venues :category-id) nil]]
+                     :filter [:and
+                              [:= [:field (meta/id :venues :name) {:base-type :type/Text}] "abc"]
+                              [:or
+                               [:is-null [:field (meta/id :venues :category-id) {:base-type :type/Integer}]]
+                               [:> [:field (meta/id :venues :price) nil] 1]]]}}
+            (expand-macros
+             (lib.tu.macros/mbql-query venues
+               {:filter   [:and
+                           [:segment 1]
+                           [:or
+                            [:segment 2]
+                            [:> $price 1]]]
+                :breakout [$category-id]}))))))
 
-;; check that when the original filter is empty we simply use our metric filter definition instead
-(expect
-  {:database 1
-   :type     :query
-   :query    {:aggregation ["count"]
-              :filter      ["AND" ["=" 5 "abc"]]
-              :breakout    [17]
-              :order_by    [[1 "ASC"]]}}
-  (tt/with-temp* [Database [{database-id :id}]
-                  Table    [{table-id :id}    {:db_id database-id}]
-                  Metric   [{metric-1-id :id} {:table_id   table-id
-                                               :definition {:aggregation ["count"]
-                                                            :filter      ["AND" ["=" 5 "abc"]]}}]]
-    (#'expand-macros/expand-metrics-and-segments {:database 1
-                                                  :type     :query
-                                                  :query    {:aggregation ["METRIC" metric-1-id]
-                                                             :filter      []
-                                                             :breakout    [17]
-                                                             :order_by    [[1 "ASC"]]}})))
+(deftest ^:parallel nested-segments-test
+  (let [metadata-provider (lib.tu/mock-metadata-provider
+                           mock-metadata-provider
+                           {:segments [{:id         2
+                                        :name       "Segment 2"
+                                        :table-id   (meta/id :venues)
+                                        :definition (let [segment-1 (lib.metadata/segment mock-metadata-provider 1)]
+                                                      (-> (lib.query/query mock-metadata-provider (meta/table-metadata :venues))
+                                                          (lib/filter (lib.filter/and
+                                                                       segment-1
+                                                                       (lib/> (meta/field-metadata :venues :price) 1)))))}]})]
+    (qp.store/with-metadata-provider metadata-provider
+      (testing "Nested segments are correctly expanded (#30866)"
+        (is (=? {:database (meta/id)
+                 :type :query
+                 :query {:source-table (meta/id :venues)
+                         :filter [:and
+                                  [:= [:field (meta/id :venues :name) {:base-type :type/Text}] "abc"]
+                                  [:> [:field (meta/id :venues :price) {:base-type :type/Integer}] 1]]}}
+                (expand-macros
+                 (lib.tu.macros/mbql-query venues
+                   {:filter [:segment 2]}))))))
+    ;; Next line makes temporary segment definitions mutually recursive.
+    (let [metadata-provider' (lib.tu/mock-metadata-provider
+                              metadata-provider
+                              {:segments [(let [segment-2 (lib.metadata/segment metadata-provider 2)]
+                                            (assoc (lib.metadata/segment metadata-provider 1)
+                                                   :definition
+                                                   (-> (lib.query/query metadata-provider (meta/table-metadata :venues))
+                                                       (lib/filter (lib.filter/and
+                                                                    (lib/< (meta/field-metadata :venues :price) 3)
+                                                                    segment-2)))))]})]
+      (qp.store/with-metadata-provider metadata-provider'
+        (testing "Expansion of mutually recursive segments causes an exception"
+          (is (thrown-with-msg?
+               Exception
+               #"\QSegment expansion failed. Check mutually recursive segment definitions.\E"
+               (expand-macros
+                (lib.tu.macros/mbql-query venues {:filter [:segment 2]})))))))))
 
-;; metric w/ no filter definition
-(expect
-  {:database 1
-   :type     :query
-   :query    {:aggregation ["count"]
-              :filter      ["AND" ["=" 5 "abc"]]
-              :breakout    [17]
-              :order_by    [[1 "ASC"]]}}
-  (tt/with-temp* [Database [{database-id :id}]
-                  Table    [{table-id :id}    {:db_id database-id}]
-                  Metric   [{metric-1-id :id} {:table_id   table-id
-                                               :definition {:aggregation ["count"]}}]]
-    (#'expand-macros/expand-metrics-and-segments {:database 1
-                                                  :type     :query
-                                                  :query    {:aggregation ["METRIC" metric-1-id]
-                                                             :filter      ["AND" ["=" 5 "abc"]]
-                                                             :breakout    [17]
-                                                             :order_by    [[1 "ASC"]]}})))
+(deftest ^:parallel segments-in-share-clauses-test
+  (testing "segments in :share clauses"
+    (qp.store/with-metadata-provider mock-metadata-provider
+      (is (=? {:database (meta/id)
+               :type :query
+               :query {:source-table (meta/id :venues)
+                       :aggregation [[:share [:and
+                                              [:= [:field (meta/id :venues :name) {:base-type :type/Text}] "abc"]
+                                              [:or
+                                               [:is-null [:field (meta/id :venues :category-id) {:base-type :type/Integer}]]
+                                               [:> [:field (meta/id :venues :price) nil] 1]]]]]}}
+              (expand-macros
+               (lib.tu.macros/mbql-query venues
+                 {:aggregation [[:share [:and
+                                         [:segment 1]
+                                         [:or
+                                          [:segment 2]
+                                          [:> $price 1]]]]]})))))))
 
-;; a metric w/ nested segments
-(expect
-  {:database 1
-   :type     :query
-   :query    {:aggregation ["sum" 18]
-              :filter      [:and
-                            ["AND"
-                             [">" 4 1]
-                             ["AND" ["IS_NULL" 7]]]
-                            ["AND"
-                             ["=" 5 "abc"]
-                             ["AND" ["BETWEEN" 9 0 25]]]]
-              :breakout    [17]
-              :order_by    [[1 "ASC"]]}}
-  (tt/with-temp* [Database [{database-id :id}]
-                  Table    [{table-id :id}     {:db_id database-id}]
-                  Segment  [{segment-1-id :id} {:table_id   table-id
-                                                :definition {:filter ["AND" ["BETWEEN" 9 0 25]]}}]
-                  Segment  [{segment-2-id :id} {:table_id   table-id
-                                                :definition {:filter ["AND" ["IS_NULL" 7]]}}]
-                  Metric   [{metric-1-id :id}  {:table_id    table-id
-                                                :definition  {:aggregation ["sum" 18]
-                                                              :filter      ["AND" ["=" 5 "abc"] ["SEGMENT" segment-1-id]]}}]]
-    (#'expand-macros/expand-metrics-and-segments {:database 1
-                                                  :type     :query
-                                                  :query    {:aggregation ["METRIC" metric-1-id]
-                                                             :filter      ["AND" [">" 4 1] ["SEGMENT" segment-2-id]]
-                                                             :breakout    [17]
-                                                             :order_by    [[1 "ASC"]]}})))
+(deftest ^:parallel segment-in-case-expression-test
+  (testing "a :segment reference nested inside a :case custom expression is expanded (#24922)"
+    (qp.store/with-metadata-provider mock-metadata-provider
+      (is (=? {:query {:expressions
+                       {"CC" [:case
+                              [[[:= [:field (meta/id :venues :name) {:base-type :type/Text}] "abc"]
+                                "Segment"]]
+                              {:default "Other"}]}}}
+              (expand-macros
+               (lib.convert/->legacy-MBQL
+                (-> (lib/query mock-metadata-provider (meta/table-metadata :venues))
+                    (lib/expression "CC" (lib/case [[(lib/segment 1) "Segment"]] "Other"))))))))))
 
-;; Check that a metric w/ multiple aggregation syntax (nested vector) still works correctly
-(datasets/expect-with-engines (engines-that-support :expression-aggregations)
-  [[2 118]
-   [3  39]
-   [4  24]]
-  (tt/with-temp Metric [metric {:table_id   (data/id :venues)
-                                :definition {:aggregation [[:sum [:field-id (data/id :venues :price)]]]
-                                             :filter      [:> [:field-id (data/id :venues :price)] 1]}}]
-    (format-rows-by [int int]
-      (rows (qp/process-query
-              {:database (data/id)
-               :type     :query
-               :query    {:source-table (data/id :venues)
-                          :aggregation  [["METRIC" (u/get-id metric)]]
-                          :breakout     [(ql/breakout (ql/field-id (data/id :venues :price)))]}})))))
-
-;; make sure that we don't try to expand GA "metrics" (#6104)
-(expect
-  {:query {:aggregation [[:metric :ga:users]]}}
-  (#'expand-macros/expand-metrics-and-segments {:query {:aggregation [[:metric :ga:users]]}}))
+(deftest ^:parallel expand-macros-in-nested-queries-test
+  (testing "expand-macros should expand things in the correct nested level (#12507)"
+    (qp.store/with-metadata-provider mock-metadata-provider
+      (let [{:keys [before after]} (lib.tu.macros/$ids
+                                     checkins
+                                     {:before {:source-table $$checkins
+                                               :filter       [:segment 2]}
+                                      :after  {:source-table $$checkins
+                                               :filter [:is-null [:field (meta/id :venues :category-id) {:base-type :type/Integer}]]}})]
+        (testing "nested 1 level"
+          (is (=? (lib.tu.macros/mbql-query nil
+                    {:source-query after})
+                  (expand-macros
+                   (lib.tu.macros/mbql-query nil
+                     {:source-query before})))))
+        (testing "nested 2 levels"
+          (is (=? (lib.tu.macros/mbql-query nil
+                    {:source-query {:source-query after}})
+                  (expand-macros
+                   (lib.tu.macros/mbql-query nil
+                     {:source-query {:source-query before}})))))
+        (testing "nested 3 levels"
+          (is (=? (lib.tu.macros/mbql-query nil
+                    {:source-query {:source-query {:source-query after}}})
+                  (expand-macros
+                   (lib.tu.macros/mbql-query nil
+                     {:source-query {:source-query {:source-query before}}})))))
+        (testing "nested at different levels"
+          (is (=? (lib.tu.macros/mbql-query nil
+                    {:source-query (-> after
+                                       (dissoc :source-table)
+                                       (assoc :source-query after))})
+                  (expand-macros
+                   (lib.tu.macros/mbql-query nil
+                     {:source-query (-> before
+                                        (dissoc :source-table)
+                                        (assoc :source-query before))})))))
+        (testing "inside :source-query inside :joins"
+          (is (=? (lib.tu.macros/mbql-query checkins
+                    {:joins [{:condition    [:= $venue-id 2]
+                              :source-query after}]})
+                  (expand-macros
+                   (lib.tu.macros/mbql-query checkins
+                     {:joins [{:condition    [:= $venue-id 2]
+                               :source-query before}]})))))
+        (testing "inside join condition"
+          (is (=? (lib.tu.macros/mbql-query checkins
+                    {:joins [{:source-table $$checkins
+                              :condition    (:filter after)}]})
+                  (expand-macros
+                   (lib.tu.macros/mbql-query checkins
+                     {:joins [{:source-table $$checkins
+                               :condition    (:filter before)}]})))))
+        (testing "inside :joins inside :source-query"
+          (is (=? (lib.tu.macros/mbql-query nil
+                    {:source-query {:source-table $$checkins
+                                    :joins        [{:condition    [:= $checkins.venue-id 2]
+                                                    :source-query after}]}})
+                  (expand-macros (lib.tu.macros/mbql-query nil
+                                   {:source-query {:source-table $$checkins
+                                                   :joins        [{:condition    [:= $checkins.venue-id 2]
+                                                                   :source-query before}]}})))))))))

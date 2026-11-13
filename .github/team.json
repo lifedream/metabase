@@ -1,0 +1,130 @@
+{
+  "teams": [
+    {
+      "name": "Querying",
+      "label": ".Team/Querying",
+      "members": [
+        "bshepherdson",
+        "dpsutton",
+        "metamben",
+        "rileythomp",
+        "technomancy"
+      ]
+    },
+    {
+      "name": "Data Apps",
+      "label": ".Team/DataApps",
+      "codeowner": "@metabase/data-apps",
+      "members": [
+        "ranquild",
+        "heypoom",
+        "sanex3339",
+        "NevRA"
+      ]
+    },
+    {
+      "name": "Graphy",
+      "label": ".Team/Graphy",
+      "members": [
+        "ranquild",
+        "galdre",
+        "escherize",
+        "alxnddr",
+        "tsplude"
+      ]
+    },
+    {
+      "name": "Embedding",
+      "label": ".Team/Embedding",
+      "members": [
+        "WiNloSt",
+        "npretto",
+        "heypoom",
+        "sanex3339"
+      ]
+    },
+    {
+      "name": "DevEx",
+      "label": ".Team/DevEx",
+      "members": [
+        "fraserdrops",
+        "nemanjaglumac",
+        "romeovs",
+        "ChrisVandoo"
+      ]
+    },
+    {
+      "name": "Metabot",
+      "label": ".Team/Metabot",
+      "codeowner": "@metabase/metabot",
+      "members": [
+        "lbrdnk",
+        "crisptrutski",
+        "andreis",
+        "prascuna",
+        "Krever",
+        "svozniuk"
+      ]
+    },
+    {
+      "name": "Cloud",
+      "label": "cloud",
+      "members": [
+        "filipesilva"
+      ]
+    },
+    {
+      "name": "UX West",
+      "label": ".Team/UXWest",
+      "members": [
+        "npfitz",
+        "nvoxland",
+        "deniskaber",
+        "andsalves",
+        "kevinkelleher12",
+        "AndreyChernykh",
+        "appleby"
+      ]
+    },
+    {
+      "name": "Gadget",
+      "label": ".Team/Gadget",
+      "members": [
+        "nmezzopera",
+        "bronsa",
+        "wotbrew",
+        "qnkhuat",
+        "chodorowicz",
+        "kamilmielnik",
+        "stasgavrylov",
+        "uladzimirdev",
+        "egorgrushin",
+        "metatyb",
+        "olehk-mb",
+        "annatomka",
+        "brybacki",
+        "BillyBobFry",
+        "radex"
+      ]
+    },
+    {
+      "name": "Growth Eng",
+      "label": ".Team/GrowthEng",
+      "members": [
+        "iethree",
+        "bpander",
+        "gantoreno",
+        "tmashara"
+      ]
+    },
+    {
+      "name": "Security Engineering",
+      "label": ".Team/SecurityEngineering",
+      "members": [
+        "bowbahdoe",
+        "enthym-aa",
+        "johnswanson"
+      ]
+    }
+  ]
+}

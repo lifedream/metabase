@@ -1,37 +1,61 @@
 (ns metabase.query-processor.middleware.cache-backend.interface
-  "Interface used to define different Query Processor cache backends.
-   Defining a backend is straightforward: define a new namespace with the pattern
+  "Interface used to define different Query Processor cache backends. To add a new backend, implement `cache-backend`
+  and have it return an object that implements the `CacheBackend` protocol.
 
-     metabase.query-processor.middleware.cache-backend.<backend>
+  See `metabase.query-processor.middleware.cache-backend.db` for a complete example of how this is done."
+  (:require
+   [buddy.core.codecs :as codecs]
+   [potemkin.types :as p.types]))
 
-   Where backend is a key representing the backend, e.g. `db`, `redis`, or `memcached`.
-
-   In that namespace, create an object that reifies (or otherwise implements) `IQueryProcessorCacheBackend`.
-   This object *must* be stored in a var called `instance`.
-
-   That's it. See `metabase.query-processor.middleware.cache-backend.db` for a complete example of how this is done.")
-
-
-(defprotocol IQueryProcessorCacheBackend
+(p.types/defprotocol+ CacheBackend
   "Protocol that different Metabase cache backends must implement.
 
-   QUERY-HASH as passed below is a byte-array representing a 256-byte SHA3 hash; encode this as needed for use as a
-   cache entry key. RESULTS are passed (and should be returned) as a Clojure object, and individual backends are free
-   to encode this as appropriate when storing the results. (It's probably not a bad idea to compress the results; this
-   is what the `:db` backend does.)"
+   `query-hash` as passed below is a byte-array representing a 256-byte SHA3 hash; encode this as needed for use as a
+   cache entry key. `results` are passed as a compressed byte array.
 
-  (cached-results [this, query-hash, ^Integer max-age-seconds]
-    "Return cached results for the query with byte array QUERY-HASH if those results are present in the cache and are less
-     than MAX-AGE-SECONDS old. Otherwise, return `nil`.
+  The implementation is responsible for purging old cache entries when appropriate."
+  (cached-results [this ^bytes query-hash respond]
+    "Call `(respond is updated-at)` with the most recent cache entry for `query-hash` *regardless of TTL* -- the results
+  as an `InputStream` to the raw bytes, plus the entry's `updated-at` timestamp -- or `(respond nil nil)` if there's no
+  entry at all. The caller compares `updated-at` against the strategy's freshness boundary to decide whether to serve
+  the entry, serve it stale while a single process refreshes, or recompute. This method *must* return the result of
+  `respond`.
 
-  This method must also return a Timestamp from when the query was last ran. This must be `assoc`ed with the query results
-  under the key `:updated_at`.
+    (cached-results [_ hash respond]
+      (if-let [entry (...)]
+        (with-open [is (...)]
+          (respond is (:updated-at entry)))
+        (respond nil nil)))")
 
-    (cached-results [_ query-hash max-age-seconds]
-      (when-let [[results updated-at] (maybe-fetch-results query-hash max-age-seconds)]
-        (assoc results :updated_at updated-at)))")
+  (save-results! [this ^bytes query-hash ^bytes results]
+    "Add a cache entry with the `results` of running query with byte array `query-hash`. This should replace any prior
+  entries for `query-hash` and update the cache timestamp to the current system time.")
 
-  (save-results! [this query-hash results]
-    "Add a cache entry with the RESULTS of running query with byte array QUERY-HASH.
-     This should replace any prior entries for QUERY-HASH and update the cache timestamp to the current system time.
-     (This is also an appropriate point to purge any entries older than the value of the `query-caching-max-ttl` Setting.)"))
+  (purge-old-entries! [this max-age-seconds]
+    "Purge all cache entries older than `max-age-seconds`. Will be called periodically when this backend is in use.
+  `max-age-seconds` may be floating-point.")
+
+  (delete-entry! [this ^bytes query-hash]
+    "Delete the cache entry for `query-hash`, if one exists, releasing any held refresh lease. Called when a query ran
+  but its results could not be saved to the cache (e.g. they exceed `query-caching-max-kb`), so the outdated entry
+  doesn't keep being served to other callers. Implementations must not throw: this is called during query result
+  reduction, and a failed cleanup shouldn't fail a query that already ran successfully.")
+
+  (try-acquire-refresh-lease! [this ^bytes query-hash lease-ms]
+    "Atomically claim, across processes, the right to recompute the expired entry for `query-hash`. Returns true iff
+  this caller won the lease (and should recompute + [[save-results!]]); false means another process is already
+  refreshing it, so this caller should serve stale results instead. A lease held longer than `lease-ms` is considered
+  abandoned and may be taken over. Backends that can't coordinate across processes should return `true` (degrading to
+  the no-stampede-protection behavior)."))
+
+(defmulti cache-backend
+  "Return an instance of a cache backend, which is any object that implements `QueryProcessorCacheBackend`.
+
+  See `db.clj` for an example Cache Backend."
+  {:arglists '([backend-name])}
+  keyword)
+
+(defn short-hex-hash
+  "Util fn. Converts a query hash to a short hex string for logging purposes."
+  [^bytes b]
+  (codecs/bytes->hex (byte-array 4 b)))

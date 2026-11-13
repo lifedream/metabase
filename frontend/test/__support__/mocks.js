@@ -1,59 +1,69 @@
-global.ga = () => {}
-global.ace.define = () => {}
-global.ace.require = () => {}
+global.ga = () => {};
+global.snowplow = () => {};
 
-global.window.matchMedia = () => ({ addListener: () => {}, removeListener: () => {} })
+global.window.matchMedia = () => ({
+  addEventListener: () => {},
+  removeEventListener: () => {},
+});
 
-// Disable analytics
-jest.mock('metabase/lib/analytics');
+/**
+ * jsdom doesn't have scrollBy or scrollTo, so we need to mock it.
+ */
+global.window.HTMLElement.prototype.scrollBy = jest.fn();
+global.window.HTMLElement.prototype.scrollTo = jest.fn();
 
-// Suppress ace import errors
-jest.mock("ace/ace", () => {}, {virtual: true});
-jest.mock("ace/mode-plain_text", () => {}, {virtual: true});
-jest.mock("ace/mode-javascript", () => {}, {virtual: true});
-jest.mock("ace/mode-json", () => {}, {virtual: true});
-jest.mock("ace/mode-clojure", () => {}, {virtual: true});
-jest.mock("ace/mode-ruby", () => {}, {virtual: true});
-jest.mock("ace/mode-html", () => {}, {virtual: true});
-jest.mock("ace/mode-jsx", () => {}, {virtual: true});
-jest.mock("ace/mode-sql", () => {}, {virtual: true});
-jest.mock("ace/mode-mysql", () => {}, {virtual: true});
-jest.mock("ace/mode-pgsql", () => {}, {virtual: true});
-jest.mock("ace/mode-sqlserver", () => {}, {virtual: true});
-jest.mock("ace/snippets/sql", () => {}, {virtual: true});
-jest.mock("ace/snippets/mysql", () => {}, {virtual: true});
-jest.mock("ace/snippets/pgsql", () => {}, {virtual: true});
-jest.mock("ace/snippets/sqlserver", () => {}, {virtual: true});
-jest.mock("ace/snippets/json", () => {}, {virtual: true});
-jest.mock("ace/snippets/json", () => {}, {virtual: true});
-jest.mock("ace/ext-language_tools", () => {}, {virtual: true});
+/**
+ * jsdom doesn't have scrollIntoView, so we need to mock it.
+ * Used e.g. under the hood in Mantine's Select component.
+ */
+global.window.HTMLElement.prototype.scrollIntoView = jest.fn();
 
-// Use test versions of components that are normally rendered to document root or use unsupported browser APIs
-import * as modal from "metabase/components/Modal";
-modal.default = modal.TestModal;
+global.window.ResizeObserver = class ResizeObserver {
+  observe() {}
 
-import * as tooltip from "metabase/components/Tooltip";
-tooltip.default = tooltip.TestTooltip
+  unobserve() {}
 
-import * as popover from "metabase/components/Popover";
-popover.default = popover.TestPopover
+  disconnect() {}
+};
 
-import * as bodyComponent from "metabase/components/BodyComponent";
-bodyComponent.default = bodyComponent.TestBodyComponent
+jest.mock("metabase/analytics");
+jest.mock("metabase/common/analytics");
 
-import * as table from "metabase/visualizations/visualizations/Table";
-table.default = table.TestTable
+jest.mock("@uiw/react-codemirror", () => {
+  const { forwardRef } = jest.requireActual("react");
 
-// Replace addEventListener with a test implementation which collects all event listeners to `eventListeners` map
-export let eventListeners = {};
-const testAddEventListener = jest.fn((event, listener) => {
-    eventListeners[event] = eventListeners[event] ? [...eventListeners[event], listener] : [listener]
-})
-const testRemoveEventListener = jest.fn((event, listener) => {
-    eventListeners[event] = (eventListeners[event] || []).filter(l => l !== listener)
-})
+  const MockEditor = forwardRef((props, ref) => {
+    const {
+      indentWithTab,
+      extensions,
+      basicSetup,
+      editable,
+      // CodeMirror-specific callbacks that React would warn about if spread
+      // onto the underlying <textarea>.
+      onUpdate,
+      onCreateEditor,
+      onStatistics,
+      ...rest
+    } = props;
+    return (
+      // @ts-expect-error: some props types are different on CodeMirror
+      <textarea
+        ref={ref}
+        {...rest}
+        value={props.value ?? ""}
+        // @ts-expect-error: We cannot provide the update argument to onChange
+        onChange={(evt) => props.onChange?.(evt.target.value, undefined)}
+        autoFocus
+        disabled={editable === false}
+      />
+    );
+  });
 
-global.document.addEventListener = testAddEventListener
-global.window.addEventListener = testAddEventListener
-global.document.removeEventListener = testRemoveEventListener
-global.window.removeEventListener = testRemoveEventListener
+  MockEditor.displayName = "MockEditor";
+
+  return {
+    __esModule: true,
+    ...jest.requireActual("@uiw/react-codemirror"),
+    default: MockEditor,
+  };
+});

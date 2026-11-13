@@ -1,23 +1,33 @@
 (ns metabase.cmd.reset-password
-  (:require [metabase.db :as mdb]
-            [metabase.models.user :refer [User] :as user]
-            [toucan.db :as db]))
+  (:require
+   [metabase.app-db.core :as mdb]
+   [metabase.auth-identity.core :as auth-identity]
+   [metabase.cmd.db :as cmd.db]
+   [metabase.util.i18n :refer [deferred-trs trs]]))
+
+(set! *warn-on-reflection* true)
 
 (defn- set-reset-token!
   "Set and return a new `reset_token` for the user with EMAIL-ADDRESS."
   [email-address]
-  (let [user-id (or (db/select-one-id User, :email email-address)
-                    (throw (Exception. (format "No user found with email address '%s'. Please check the spelling and try again." email-address))))]
-    (user/set-password-reset-token! user-id)))
+  (let [{user-id :id, active? :is_active}
+        (or (cmd.db/user-id-and-active-by-email email-address)
+            (throw (Exception. (str (deferred-trs "No user found with email address ''{0}''. " email-address)
+                                    (deferred-trs "Please check the spelling and try again.")))))]
+    (when-not active?
+      (throw (Exception. (str (deferred-trs "Cannot reset the password for the deactivated user ''{0}''. Please reactivate the account and try again."
+                                            email-address)))))
+    (auth-identity/create-password-reset! user-id)))
 
 (defn reset-password!
   "Reset the password for EMAIL-ADDRESS, and return the reset token in a format that can be understood by the Mac App."
   [email-address]
-  (mdb/setup-db!)
-  (println (format "Resetting password for %s...\n" email-address))
+  (mdb/setup-db! :create-sample-content? false)
+  (println (str (deferred-trs "Resetting password for {0}..." email-address)
+                "\n"))
   (try
-    (println (format "OK [[[%s]]]" (set-reset-token! email-address)))
+    (println (trs "OK [[[{0}]]]" (set-reset-token! email-address)))
     (System/exit 0)
     (catch Throwable e
-      (println (format "FAIL [[[%s]]]" (.getMessage e)))
+      (println (trs "FAIL [[[{0}]]]" (.getMessage e)))
       (System/exit -1))))

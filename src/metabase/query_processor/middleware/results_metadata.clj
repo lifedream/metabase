@@ -2,105 +2,185 @@
   "Middleware that stores metadata about results column types after running a query for a Card,
    and returns that metadata (which can be passed *back* to the backend when saving a Card) as well
    as a checksum in the API response."
-  (:require [buddy.core.hash :as hash]
-            [cheshire.core :as json]
-            [clojure.tools.logging :as log]
-            [metabase.models.humanization :as humanization]
-            [metabase.query-processor.interface :as i]
-            [metabase.util :as u]
-            [metabase.util
-             [encryption :as encryption]
-             [schema :as su]]
-            [ring.util.codec :as codec]
-            [schema.core :as s]
-            [toucan.db :as db]))
+  (:refer-clojure :exclude [mapv select-keys get-in])
+  (:require
+   [clojure.string :as str]
+   [malli.error :as me]
+   [metabase.analyze.core :as analyze]
+   [metabase.driver :as driver]
+   [metabase.driver.util :as driver.u]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.lib.schema :as lib.schema]
+   [metabase.lib.schema.metadata :as lib.schema.metadata]
+   [metabase.queries.schema :as queries.schema]
+   [metabase.query-processor.db :as query-processor.db]
+   [metabase.query-processor.middleware.row-restricted-metadata :as row-restricted-metadata]
+   [metabase.query-processor.reducible :as qp.reducible]
+   [metabase.query-processor.schema :as qp.schema]
+   ;; still passes state via the store's miscellaneous-value slot; general-cached-value migration pending
+   ^{:clj-kondo/ignore [:deprecated-namespace]} [metabase.query-processor.store :as qp.store]
+   [metabase.util :as u]
+   [metabase.util.log :as log]
+   [metabase.util.malli :as mu]
+   [metabase.util.malli.registry :as mr]
+   [metabase.util.performance :refer [mapv select-keys get-in]]))
 
-(def ^:private DateTimeUnitKeywordOrString
-  "Schema for a valid datetime unit string like \"default\" or \"minute-of-hour\"."
-  (s/constrained su/KeywordOrString
-                 (fn [unit]
-                   (contains? i/datetime-field-units (keyword unit)))
-                 "Valid field datetime unit keyword or string"))
+;;; +----------------------------------------------------------------------------------------------------------------+
+;;; |                                                   Middleware                                                   |
+;;; +----------------------------------------------------------------------------------------------------------------+
 
-(def ResultsMetadata
-  "Schema for valid values of the `result_metadata` column."
-  (su/with-api-error-message (s/named [{:name                          su/NonBlankString
-                                        :display_name                  su/NonBlankString
-                                        (s/optional-key :description)  (s/maybe su/NonBlankString)
-                                        :base_type                     su/FieldTypeKeywordOrString
-                                        (s/optional-key :special_type) (s/maybe su/FieldTypeKeywordOrString)
-                                        (s/optional-key :unit)         (s/maybe DateTimeUnitKeywordOrString)}]
-                                      "Valid array of results column metadata maps")
-    "value must be an array of valid results column metadata maps."))
+(mu/defn- comparable-metadata
+  "A comparable representation of `metadata`, normalized so inconsequential differences don't register as a
+  change. With `parameter-independent?` true, two runs over different parameter values compare equal when the
+  column structure matches."
+  ([metadata :- [:maybe [:sequential ::lib.schema.metadata/lib-or-legacy-column]]]
+   (comparable-metadata metadata false))
+  ([metadata              :- [:maybe [:sequential ::lib.schema.metadata/lib-or-legacy-column]]
+    parameter-independent? :- :boolean]
+   (letfn [(remove-underscore-nil-keys
+             ;; Sometimes we get an underscore version of a key with a nil value which is a duplicate of a key with a
+             ;; dash. Remove the nil value
+             [m]
+             (reduce-kv
+              (fn [acc k v]
+                (let [kebab-cased-key (when (str/includes? (name k) "_")
+                                        (keyword (str/replace (name k) "_" "-")))]
+                  (if (and kebab-cased-key
+                           (nil? v)
+                           (contains? m kebab-cased-key))
+                    acc
+                    (assoc acc k v))))
+              {} m))
+           (standardize-metadata [m]
+             (cond
+               (keyword? m) (u/qualified-name m)
+               (map? m) (cond-> (-> (update-vals m standardize-metadata)
+                                    (dissoc :ident) ; `:ident` is deprecated and should no longer be present, but better safe than sorry.
+                                    (remove-underscore-nil-keys))
+                          parameter-independent? (dissoc :fingerprint))
+               (sequential? m) (mapv standardize-metadata m)
+               (set? m) (into #{} (map standardize-metadata) m)
+               :else m))]
+     (mapv standardize-metadata metadata))))
 
-(s/defn ^:private results->column-metadata :- (s/maybe ResultsMetadata)
-  "Return the desired storage format for the column metadata coming back from RESULTS, or `nil` if no columns were returned."
-  [results]
-  ;; rarely certain queries will return columns with no names, for example `SELECT COUNT(*)` in SQL Server seems to come back with no name
-  ;; since we can't use those as field literals in subsequent queries just filter them out
-  (seq (for [col   (:cols results)
-             :when (seq (:name col))]
-         (merge
-          ;; if base-type isn't set put a default one in there. Similarly just use humanized value of `:name` for `:display_name` if one isn't set
-          {:base_type    :type/*
-           :display_name (humanization/name->human-readable-name (name (:name col)))}
-          (u/select-non-nil-keys col [:name :display_name :description :base_type :special_type :unit])
-          ;; since years are actually returned as text they can't be used for breakout purposes so don't advertise them as DateTime columns
-          (when (= (:unit col) :year)
-            {:base_type :type/Text
-             :unit      nil})))))
+(mu/defn- record-metadata!
+  [{{:keys [card-id]} :info, :as query} :- ::lib.schema/query
+   metadata                             :- [:maybe [:sequential ::lib.schema.metadata/lib-or-legacy-column]]]
+  (try
+    ;; At the very least we can skip the Extra DB call to update this Card's metadata results
+    ;; if its DB doesn't support nested queries in the first place
+    (let [actual-metadata (or (when-let [pivot-metadata (get-in query [:info :pivot/result-metadata])]
+                                (when (sequential? pivot-metadata)
+                                  pivot-metadata))
+                              metadata)]
+      (when (and actual-metadata
+                 driver/*driver*
+                 ;; pivot queries can run multiple queries, only record metadata for the main query
+                 (not= actual-metadata :none)
+                 (driver.u/supports? driver/*driver* :nested-queries (lib.metadata/database query))
+                 card-id
+                 ;; don't want to update metadata when we use a Card as a source Card.
+                 (not (:qp/source-card-id query))
+                 ;; `:qp/skip-result-metadata-persistence` is an absolute skip set by callers (e.g.
+                 ;; `qp.card/process-query-for-card` when a `card-transform` rewrites the query) to tell us
+                 ;; this run's output is not the Card's canonical shape.
+                 (not (:qp/skip-result-metadata-persistence query))
+                 ;; A row-restricted run (sandbox, impersonation, DB routing) returns metadata without fingerprints.
+                 ;; Persisting it would erase the whole-table fingerprints an unrestricted run stored for every reader.
+                 (not (row-restricted-metadata/row-restricted? query))
+                 ;; Only update changed metadata; a non-default parameterized run writes only on
+                 ;; parameter-independent column changes, not fingerprint drift (#83734, see also #72007).
+                 (let [parameter-independent? (boolean (:qp/non-default-parameterized? query))]
+                   (not= (comparable-metadata actual-metadata parameter-independent?)
+                         (comparable-metadata
+                          ;; existing usage -- don't use going forward
+                          #_{:clj-kondo/ignore [:deprecated-var]}
+                          (qp.store/miscellaneous-value [::card-stored-metadata])
+                          parameter-independent?))))
+        (when-let [error (me/humanize (mr/explain [:sequential ::lib.schema.metadata/lib-or-legacy-column] actual-metadata))]
+          (throw (ex-info "Invalid result metadata!" {:error error, :metadata actual-metadata})))
+        (query-processor.db/set-card-result-metadata! card-id actual-metadata)))
+    ;; if for some reason we weren't able to record results metadata for this query then just proceed as normal
+    ;; rather than failing the entire query
+    (catch Throwable e
+      (log/errorf "Error recording results metadata for query: %s" (ex-message e)))))
 
-;; TODO - is there some way we could avoid doing this every single time a Card is ran? Perhaps by passing the current Card
-;; metadata as part of the query context so we can compare for changes
-(defn- record-metadata! [card-id metadata]
-  (when metadata
-    (db/update! 'Card card-id
-      :result_metadata metadata)))
+(defn- merge-final-column-metadata
+  "Because insights are generated by reducing functions, they start working before the entire query metadata is in its
+  final form. Some columns come back without type information, and thus get an initial base type of `:type/*` (unknown
+  type); in this case, the `annotate` middleware scans the first few values and infers a base type, adding that
+  information to the column metadata in the final result.
 
-(defn- metadata-checksum
-  "Simple, checksum of the column results METADATA.
-   Results metadata is returned as part of all query results, with the hope that the frontend will pass it back to
-   us when a Card is saved or updated. This checksum (also passed) is a simple way for us to check whether the metadata
-   is valid and hasn't been accidentally tampered with.
+  This function merges inferred column base types added by `annotate` into the metadata generated by `insights`."
+  [final-col-metadata insights-col-metadata]
+  ;; the two metadatas will both be in order that matches the column order of the results
+  (mapv
+   (fn [{final-base-type      :base_type
+         final-effective-type :effective_type
+         :as final-col}
+        {our-base-type      :base_type
+         our-effective-type :effective_type
+         :as insights-col}]
+     (merge
+      (select-keys final-col [:id :description :display_name :semantic_type :fk_target_field_id
+                              :settings :field_ref :base_type :effective_type :database_type
+                              :remapped_from :remapped_to :coercion_strategy :visibility_type
+                              :was_binned :table_id])
+      insights-col
+      {:name (:name final-col)} ; The final cols have correctly disambiguated ID_2 names, but the insights cols don't.
+      (when (= our-base-type :type/*)
+        {:base_type final-base-type})
+      (when (= our-effective-type :type/*)
+        {:effective_type final-effective-type})))
+   final-col-metadata
+   insights-col-metadata))
 
-   By default, this is not cryptographically secure, nor is it meant to be. Of course, a bad actor could alter the
-   metadata and return a new, correct checksum. But intentionally saving bad metadata would only help in letting you
-   write bad queries; the field literals can only refer to columns in the original 'source' query at any rate, so you
-   wouldn't, for example, be able to give yourself access to columns in a different table.
+(mu/defn- insights-xform :- fn?
+  [orig-metadata      :- [:maybe ::qp.schema/metadata]
+   record!            :- ifn?
+   keep-fingerprints? :- :boolean
+   rf                 :- ifn?]
+  (qp.reducible/combine-additional-reducing-fns
+   rf
+   [(analyze/insights-rf orig-metadata)]
+   (fn combine [result {:keys [metadata insights]}]
+     (let [metadata (cond-> (merge-final-column-metadata (-> result :data :cols) metadata)
+                      (not keep-fingerprints?) row-restricted-metadata/remove-fingerprints)]
+       (record! metadata)
+       (rf (cond-> result
+             (map? result)
+             (update :data
+                     assoc
+                     ;; TODO: We agreed on the name `:result_metadata` everywhere, and this needs updating.
+                     ;; It'll definitely break things on the FE, so a coordinated change is needed.
+                     :results_metadata {:columns metadata}
+                     :insights         insights)))))))
 
-   However, if `MB_ENCRYPTION_SECRET_KEY` is set, we'll go ahead and use it to encypt the checksum so it becomes it
-   becomes impossible to alter the metadata and produce a correct checksum at any rate."
-  [metadata]
-  (when metadata
-    (encryption/maybe-encrypt (codec/base64-encode (hash/md5 (json/generate-string metadata))))))
+(mu/defn record-and-return-metadata! :- ::qp.schema/rff
+  "Post-processing middleware that records metadata about the columns returned when running the query. Returns an rff."
+  [{{:keys [skip-results-metadata? skip-result-metadata-persistence?]} :middleware, :as query}
+   :- ::qp.schema/any-query
+   rff :- ::qp.schema/rff]
+  (if skip-results-metadata?
+    rff
+    (let [query   (cond-> query
+                    skip-result-metadata-persistence?
+                    (assoc :qp/skip-result-metadata-persistence true))
+          record! (partial record-metadata! query)
+          ;; With no fingerprint on the cols of a row-restricted run (sandbox, impersonation, DB routing), the insights
+          ;; step computes one over the rows the current user sees. The frontend posts `:results_metadata` back as the
+          ;; Card's `result_metadata` when the user saves the question, which would hand that subset's statistics to
+          ;; every reader of the Card, so such a run returns no fingerprint in `:results_metadata` either.
+          keep-fingerprints? (not (row-restricted-metadata/row-restricted? query))]
+      (fn record-and-return-metadata!-rff* [metadata]
+        (insights-xform metadata record! keep-fingerprints? (rff metadata))))))
 
-(defn valid-checksum?
-  "Is the CHECKSUM the right one for this column METADATA?"
-  [metadata checksum]
-  (and metadata
-       checksum
-       (= (encryption/maybe-decrypt (metadata-checksum metadata))
-          (encryption/maybe-decrypt checksum))))
-
-(defn record-and-return-metadata!
-  "Middleware that records metadata about the columns returned when running the query if it is associated with a Card."
-  [qp]
-  (fn [{{:keys [card-id nested?]} :info, :as query}]
-    (let [results (qp query)]
-      (try
-        (let [metadata (results->column-metadata results)]
-          ;; At the very least we can skip the Extra DB call to update this Card's metadata results
-          ;; if its DB doesn't support nested queries in the first place
-          (when (i/driver-supports? :nested-queries)
-            (when (and card-id
-                       (not nested?))
-              (record-metadata! card-id metadata)))
-          ;; add the metadata and checksum to the response
-          (assoc results :results_metadata {:checksum (metadata-checksum metadata)
-                                            :columns  metadata}))
-        ;; if for some reason we weren't able to record results metadata for this query then just proceed as normal
-        ;; rather than failing the entire query
-        (catch Throwable e
-          (log/error "Error recording results metadata for query:" (.getMessage e) "\n"
-                     (u/pprint-to-str (u/filtered-stacktrace e)))
-          results)))))
+(mu/defn store-previous-result-metadata!
+  "Store the previous value of a card's result metadata in the qp.store"
+  [card :- [:maybe ::queries.schema/card]]
+  (when-let [result-metadata (:result_metadata card)]
+    (if-let [error (me/humanize (mr/explain [:sequential ::lib.schema.metadata/lib-or-legacy-column] result-metadata))]
+      (log/errorf "Invalid card result metadata, ignoring  it: %s" (pr-str error))
+      ;; existing usage -- don't use going forward
+      #_{:clj-kondo/ignore [:deprecated-var]}
+      (qp.store/store-miscellaneous-value! [::card-stored-metadata] result-metadata))))

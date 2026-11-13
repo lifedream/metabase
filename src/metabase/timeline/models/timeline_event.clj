@@ -1,0 +1,116 @@
+(ns metabase.timeline.models.timeline-event
+  (:require
+   [metabase.models.interface :as mi]
+   [metabase.remote-sync.core :as remote-sync]
+   [metabase.serialization.core :as serialization]
+   [metabase.timeline.db :as timeline.db]
+   [metabase.timeline.schema :as timeline.schema]
+   [methodical.core :as methodical]
+   [toucan2.core :as t2]))
+
+(methodical/defmethod t2/table-name :model/TimelineEvent  [_model] :timeline_event)
+
+(doto :model/TimelineEvent
+  (derive :metabase/model)
+  (derive :hook/timestamped?)
+  (derive :hook/entity-id)
+  (derive ::mi/read-policy.full-perms-for-perms-set)
+  (derive ::mi/write-policy.full-perms-for-perms-set))
+
+;;;; schemas
+
+(def default-icon
+  "The default icon for Timeline and TimelineEvents."
+  "star")
+
+(def Icon
+  "Schema for Timeline and TimelineEvents `icon`"
+  ;; using "mail" icon is deprecated, but we keep it for backwards compatibility
+  [:enum default-icon "cake" "mail" "mail_at" "warning" "bell" "cloud"
+   "info" "note" "event"])
+
+(def Source
+  "Timeline Event Source Schema. For Snowplow Events, where the Event is created from is important.
+  Events are added from one of four sources: `collections`, `question` (cards in backend code), `dashboard`, or directly
+  with an API call. An API call is indicated by having no source key in the `timeline-event` request."
+  [:enum "collections" "question" "dashboard"])
+
+;;;; transforms
+
+(t2/define-after-select :model/TimelineEvent
+  [timeline-event]
+  ;; We used to have a "balloons" icon but we removed it.
+  ;; Use the default icon instead. (metabase#34586, metabase#35129)
+  (update timeline-event :icon (fn [icon]
+                                 (if (= icon "balloons") default-icon icon))))
+
+;;;; permissions
+
+(defmethod mi/perms-objects-set :model/TimelineEvent
+  [event read-or-write]
+  (let [timeline (or (:timeline event)
+                     (timeline.db/timeline (:timeline_id event)))]
+    (mi/perms-objects-set timeline read-or-write)))
+
+(defmethod mi/can-create? :model/TimelineEvent
+  [_ {:keys [timeline]}]
+  (mi/can-create? :model/Timeline {:collection_id (:collection_id timeline)}))
+
+;;;; hydration
+
+(methodical/defmethod t2/batched-hydrate [:model/TimelineEvent :timeline]
+  [_model k events]
+  (mi/instances-with-hydrated-data
+   events k
+   #(timeline.db/timelines-by-id (map :timeline_id events))
+   :timeline_id))
+
+(defn- fetch-events
+  "Fetch events for timelines in `timeline-ids`. Can include optional `start` and `end` dates in the options map, as
+  well as `all?`. By default, will return only unarchived events, unless `all?` is truthy and will return all events
+  regardless of archive state."
+  [timeline-ids {:events/keys [all? start end]}]
+  (t2/hydrate (timeline.db/timeline-events-for-timelines timeline-ids all? start end) :creator))
+
+(defn include-events
+  "Include events on `timelines` passed in. Options are optional and include whether to return unarchived events or all
+  events regardless of archive status (`all?`), and `start` and `end` parameters for events."
+  [timelines options]
+  (if-not (seq timelines)
+    []
+    (let [timeline-id->events (->> (fetch-events (map :id timelines) options)
+                                   (group-by :timeline_id))]
+      (for [{:keys [id] :as timeline} timelines]
+        (let [events (timeline-id->events id)]
+          (when timeline
+            (assoc timeline :events (if events events []))))))))
+
+(defn include-events-singular
+  "Similar to [[include-events]] but allows for passing a single timeline not in a collection."
+  ([timeline] (include-events-singular timeline {}))
+  ([timeline options]
+   (first (include-events [timeline] options))))
+
+(defn dashcard-timeline-events
+  "Look for a timeline and corresponding events associated with this dashcard."
+  [{{:keys [collection_id] :as _card} :card}]
+  (let [timelines (timeline.db/timelines-for-collection collection_id false)]
+    (->> (t2/hydrate timelines :creator [:collection :can_write])
+         (map #(include-events-singular % {:events/all? true})))))
+
+;;;; model
+
+;;;; serialization
+
+(defmethod serialization/spec :model/TimelineEvent [_]
+  {:schema    ::timeline.schema/external-timeline-event
+   :copy      [:archived :description :entity_id :icon :name :time_matters :timezone]
+   :parent    {:model :model/Timeline :key :timeline_id :order (juxt :name :entity_id)}
+   :transform {:timeline_id serialization/import-only-transform
+               :creator_id serialization/user-transform
+               :timestamp  serialization/date-transform}
+   :defaults  {:archived false}})
+
+(defmethod remote-sync/spec :model/TimelineEvent
+  [_model]
+  {:synced-filter-clause timeline.db/synced-timeline-events-clause})

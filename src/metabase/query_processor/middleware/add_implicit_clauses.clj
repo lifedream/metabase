@@ -1,85 +1,93 @@
 (ns metabase.query-processor.middleware.add-implicit-clauses
-  "Middlware for adding an implicit `:fields` and `:order-by` clauses to certain queries."
-  (:require [clojure.tools.logging :as log]
-            [metabase.models.field :refer [Field]]
-            [metabase.query-processor
-             [interface :as i]
-             [sort :as sort]
-             [util :as qputil]]
-            [metabase.query-processor.middleware.resolve :as resolve]
-            [toucan
-             [db :as db]
-             [hydrate :refer [hydrate]]]))
+  "Middleware for adding an implicit `:fields` and `:order-by` clauses to certain queries."
+  (:refer-clojure :exclude [every? empty? not-empty])
+  (:require
+   [metabase.lib.core :as lib]
+   [metabase.lib.metadata :as lib.metadata]
+   [metabase.lib.schema :as lib.schema]
+   [metabase.lib.walk :as lib.walk]
+   [metabase.query-processor.error-type :as qp.error-type]
+   [metabase.util.i18n :refer [tru]]
+   [metabase.util.malli :as mu]
+   [metabase.util.match :as match]
+   [metabase.util.performance :refer [every? empty? not-empty]]))
 
-(defn- fetch-fields-for-souce-table-id [source-table-id]
-  (map resolve/rename-mb-field-keys
-       (-> (db/select [Field :name :display_name :base_type :special_type :visibility_type :table_id :id :position
-                       :description :fingerprint]
-             :table_id        source-table-id
-             :active          true
-             :visibility_type [:not-in ["sensitive" "retired"]]
-             :parent_id       nil
-             {:order-by [[:position :asc]
-                         [:id :desc]]})
-            (hydrate :values)
-            (hydrate :dimensions))))
+(mu/defn- should-add-implicit-fields?
+  "Whether we should add implicit Fields to a `stage`. True if all of the following are true:
 
-(defn- fields-for-source-table
-  "Return the all fields for SOURCE-TABLE, for use as an implicit `:fields` clause."
-  [{{source-table-id :id, :as source-table} :source-table, :as inner-query}]
-  ;; Sort the implicit FIELDS so the SQL (or other native query) that gets generated (mostly) approximates the 'magic' sorting
-  ;; we do on the results. This is done so when the outer query we generate is a `SELECT *` the order doesn't change
-  (for [field (sort/sort-fields inner-query (fetch-fields-for-souce-table-id source-table-id))
-        :let  [field (-> field
-                         resolve/convert-db-field
-                         (resolve/resolve-table {[nil source-table-id] source-table}))]]
-    (if (qputil/datetime-field? field)
-      (i/map->DateTimeField {:field field, :unit :default})
-      field)))
+  *  The stage is an MBQL stage
+  *  The stage has no breakouts
+  *  The stage has no aggregations
+  *  The stage does not already have `:fields`"
+  [{:keys        [fields]
+    breakouts    :breakout
+    aggregations :aggregation, :as stage} :- ::lib.schema/stage]
+  (and (= (:lib/type stage) :mbql.stage/mbql)
+       (every? empty? [aggregations breakouts fields])))
 
-(defn- should-add-implicit-fields? [{:keys [fields breakout source-table], aggregations :aggregation}]
-  (and source-table ; if query is using another query as its source then there will be no table to add nested fields for
-       (not (or (seq aggregations)
-                (seq breakout)
-                (seq fields)))))
+(mu/defn- add-implicit-fields :- [:maybe ::lib.schema/stage]
+  "For stages with no aggregation, add a `:fields` key containing all Fields in the source Table as well as any
+  expressions defined in the stage."
+  [query                                      :- ::lib.schema/query
+   path                                       :- ::lib.walk/path
+   {source-table-id :source-table, :as stage} :- ::lib.schema/stage]
+  (when (should-add-implicit-fields? stage)
+    (let [cols        (if source-table-id
+                        (lib/returned-columns query (lib.metadata/table query source-table-id))
+                        (for [col (lib.walk/apply-f-for-stage-at-path
+                                   lib/returned-columns
+                                   query
+                                   (or (lib.walk/previous-path path)
+                                       (throw (ex-info "Expected :source-card to be spliced into the query by now"
+                                                       {:type qp.error-type/invalid-query}))))]
+                          (lib/update-keys-for-col-from-previous-stage col)))
+          ;; generate a new expression ref clause for each expression defined in the query.
+          expressions (lib.walk/apply-f-for-stage-at-path lib/expressions-metadata query path)]
+      ;; if the Table has no Fields, throw an Exception, because there is no way for us to proceed
+      (when (and (empty? cols)
+                 source-table-id)
+        (throw (ex-info (tru "Table ''{0}'' has no Fields associated with it." (:name (lib.metadata/table query source-table-id)))
+                        {:type qp.error-type/invalid-query})))
+      ;; add the fields & expressions under the `:fields` clause
+      (when (seq cols)
+        (letfn [(updated-stage [query stage-number]
+                  (-> (lib/with-fields query stage-number (concat cols expressions))
+                      (lib/query-stage stage-number)
+                      ;; this is used
+                      ;; by [[metabase.lib.metadata.result-metadata/super-broken-legacy-field-ref]] (via [[metabase.lib.stage/fields-columns]])
+                      ;; so it knows to force Field ID `:field_ref`s in the QP results metadata to preserve historic
+                      ;; behavior
+                      (assoc :qp/added-implicit-fields? true)))]
+          (lib.walk/apply-f-for-stage-at-path updated-stage (assoc-in query path stage) path))))))
 
-(defn- add-implicit-fields [{:keys [source-table], :as inner-query}]
-  (if-not (should-add-implicit-fields? inner-query)
-    inner-query
-    ;; this is a structured `:rows` query, so lets add a `:fields` clause with all fields from the source table + expressions
-    (let [inner-query (assoc inner-query :fields-is-implicit true)
-          fields      (fields-for-source-table inner-query)
-          expressions (for [[expression-name] (:expressions inner-query)]
-                        (i/strict-map->ExpressionRef {:expression-name (name expression-name)}))]
-      (when-not (seq fields)
-        (log/warn (format "Table '%s' has no Fields associated with it." (:name source-table))))
-      (assoc inner-query
-        :fields (concat fields expressions)))))
+(defn- has-window-function-aggregations? [stage]
+  (or (match/match-one (mapcat stage [:aggregation :expressions])
+        [#{:cum-sum :cum-count :offset} & _]
+        true)
+      ;; FIXME
+      (when-let [source-query (:source-query stage)]
+        (has-window-function-aggregations? source-query))))
 
+(mu/defn- add-implicit-breakout-order-by :- [:maybe ::lib.schema/stage]
+  "Fields specified in `breakout` should add an implicit ascending `order-by` subclause *unless* that Field is already
+  *explicitly* referenced in `order-by`."
+  [query :- ::lib.schema/query
+   path  :- ::lib.walk/path
+   stage :- ::lib.schema/stage]
+  (when-not (has-window-function-aggregations? stage)
+    (when-let [breakouts (not-empty (:breakout stage))]
+      (letfn [(updated-stage [query stage-number]
+                (-> (reduce (fn [query breakout]
+                              (lib/order-by query stage-number (lib/fresh-uuids breakout) :asc))
+                            query
+                            breakouts)
+                    (lib/query-stage stage-number)))]
+        (lib.walk/apply-f-for-stage-at-path updated-stage (assoc-in query path stage) path)))))
 
-
-(defn- add-implicit-breakout-order-by
-  "`Fields` specified in `breakout` should add an implicit ascending `order-by` subclause *unless* that field is *explicitly* referenced in `order-by`."
-  [{breakout-fields :breakout, order-by :order-by, :as inner-query}]
-  (let [order-by-fields                   (set (map (comp #(select-keys % [:field-id :fk-field-id]) :field) order-by))
-        implicit-breakout-order-by-fields (remove (comp order-by-fields #(select-keys % [:field-id :fk-field-id]))
-                                                  breakout-fields)]
-    (cond-> inner-query
-      (seq implicit-breakout-order-by-fields) (update :order-by concat (for [field implicit-breakout-order-by-fields]
-                                                                         {:field field, :direction :ascending})))))
-
-(defn- add-implicit-clauses-to-inner-query [inner-query]
-  (cond-> (add-implicit-fields (add-implicit-breakout-order-by inner-query))
-    ;; if query has a source query recursively add implicit clauses to that too as needed
-    (:source-query inner-query) (update :source-query add-implicit-clauses-to-inner-query)))
-
-(defn- maybe-add-implicit-clauses [query]
-  (if-not (qputil/mbql-query? query)
-    query
-    (update query :query add-implicit-clauses-to-inner-query)))
-
-(defn add-implicit-clauses
+(mu/defn add-implicit-clauses :- ::lib.schema/query
   "Add an implicit `fields` clause to queries with no `:aggregation`, `breakout`, or explicit `:fields` clauses.
    Add implicit `:order-by` clauses for fields specified in a `:breakout`."
-  [qp]
-  (comp qp maybe-add-implicit-clauses))
+  [query :- ::lib.schema/query]
+  (-> query
+      (lib.walk/walk-stages add-implicit-breakout-order-by)
+      (lib.walk/walk-stages add-implicit-fields)))

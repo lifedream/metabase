@@ -1,129 +1,171 @@
 (ns metabase.sync.interface
   "Schemas and constants used by the sync code."
-  (:require [clj-time.core :as time]
-            [metabase.models
-             [database :refer [Database]]
-             [field :refer [Field]]
-             [table :refer [Table]]]
-            metabase.types
-            [metabase.util :as u]
-            [metabase.util.schema :as su]
-            [schema.core :as s]))
+  (:require
+   [malli.util :as mut]
+   [metabase.lib.schema.common :as lib.schema.common]
+   [metabase.lib.schema.metadata :as lib.schema.metadata]
+   [metabase.util.malli.registry :as mr]
+   [metabase.util.malli.schema :as ms]))
 
+(mr/def ::DatabaseMetadataTable
+  [:map {:closed true}
+   [:name                                     ::lib.schema.common/non-blank-string]
+   [:schema                                   [:maybe ::lib.schema.common/non-blank-string]]
+   ;; true if the current connection can make insert, update and delete operations. Only works for drivers that support
+   ;; :table-privileges feature
+   [:is_writable             {:optional true} [:maybe :boolean]]
+   ;; for databases that store an estimated row count in system tables (e.g: postgres)
+   [:estimated_row_count     {:optional true} [:maybe :int]]
+   ;; for databases that support forcing query to include a filter (e.g: partitioned table on bigquery)
+   [:database_require_filter {:optional true} [:maybe :boolean]]
+   ;; `:description` in this case should be a column/remark on the Table, if there is one.
+   [:description             {:optional true} [:maybe :string]]
+   [:visibility_type         {:optional true} [:maybe :string]]])
 
 (def DatabaseMetadataTable
   "Schema for the expected output of `describe-database` for a Table."
-  {:name   su/NonBlankString
-   :schema (s/maybe su/NonBlankString)})
+  [:ref ::DatabaseMetadataTable])
+
+(mr/def ::DatabaseMetadata
+  [:map {:closed true}
+   [:tables [:fn {:error/message "a set, sequential, or reducible collection of tables"}
+             (fn [x] (or (set? x) (sequential? x) (instance? clojure.lang.IReduceInit x)))]]
+   [:version {:optional true} [:maybe ::lib.schema.common/non-blank-string]]
+   [:metabase-metadata-tables {:optional true} (ms/InstanceOfClass clojure.lang.Volatile)]])
 
 (def DatabaseMetadata
   "Schema for the expected output of `describe-database`."
-  {:tables #{DatabaseMetadataTable}})
+  [:ref ::DatabaseMetadata])
 
+(mr/def ::TableMetadataField
+  [:map {:closed true}
+   [:name              ::lib.schema.common/non-blank-string]
+   [:database-type     [:maybe ::lib.schema.common/non-blank-string]] ; blank if the Field is all NULL & untyped, i.e. in Mongo
+   [:base-type         ::lib.schema.common/base-type]
+   [:database-position nat-int?]
+   [:position                   {:optional true} nat-int?]
+   [:semantic-type              {:optional true} [:maybe ::lib.schema.common/semantic-or-relation-type]]
+   [:effective-type             {:optional true} [:maybe ::lib.schema.common/base-type]]
+   [:coercion-strategy          {:optional true} [:maybe ms/CoercionStrategy]]
+   [:field-comment              {:optional true} [:maybe ::lib.schema.common/non-blank-string]]
+   [:pk?                        {:optional true} :boolean] ; optional for databases that don't support PKs
+   [:nested-fields              {:optional true} [:set [:ref ::TableMetadataField]]]
+   [:json-unfolding             {:optional true} :boolean]
+   ;; TODO (Cam 8/11/25) -- this should be required to be a sequence of strings but we'll need to go fix some code
+   [:nfc-path                   {:optional true} [:maybe [:sequential [:or :keyword :string]]]]
+   [:custom                     {:optional true} ms/OpaqueJSONObject]
+   [:database-default           {:optional true} :string]
+   [:database-is-auto-increment {:optional true} :boolean]
+   [:database-is-generated      {:optional true} :boolean]
+   [:database-is-nullable       {:optional true} :boolean]
+   ;; nullable for databases that don't support field partition
+   [:database-partitioned       {:optional true} [:maybe :boolean]]
+   [:database-required          {:optional true} :boolean]
+   [:visibility-type            {:optional true} [:maybe :keyword]]
+   [:jdbc-type                  {:optional true} [:maybe :int]]
+   [:preview-display            {:optional true} :boolean]
+   [:table-name                 {:optional true} ::lib.schema.common/non-blank-string]
+   [:table-schema               {:optional true} [:maybe ::lib.schema.common/non-blank-string]]])
 
 (def TableMetadataField
-  "Schema for a given Field as provided in `describe-table`."
-  {:name                           su/NonBlankString
-   :database-type                  su/NonBlankString
-   :base-type                      su/FieldType
-   (s/optional-key :special-type)  (s/maybe su/FieldType)
-   (s/optional-key :pk?)           s/Bool
-   (s/optional-key :nested-fields) #{(s/recursive #'TableMetadataField)}
-   (s/optional-key :custom)        {s/Any s/Any}})
+  "Schema for a given Field as provided in [[metabase.driver/describe-table]]."
+  [:ref ::TableMetadataField])
 
-(def TableMetadata
-  "Schema for the expected output of `describe-table`."
-  {:name   su/NonBlankString
-   :schema (s/maybe su/NonBlankString)
-   :fields #{TableMetadataField}})
+(mr/def ::TableIndexMetadata
+  [:set
+   [:and
+    [:map
+     [:type [:enum :normal-column-index :nested-column-index]]]
+    [:multi {:dispatch :type}
+     [:normal-column-index [:map [:value ::lib.schema.common/non-blank-string]]]
+     [:nested-column-index [:map [:value [:sequential ::lib.schema.common/non-blank-string]]]]]]])
+
+(def TableIndexMetadata
+  "Schema for a given Table as provided in [[metabase.driver/describe-table-indexes]]."
+  [:ref ::TableIndexMetadata])
+
+(mr/def ::FieldIndexMetadata
+  [:map
+   [:table-schema [:maybe ::lib.schema.common/non-blank-string]]
+   [:table-name   ::lib.schema.common/non-blank-string]
+   [:field-name   ::lib.schema.common/non-blank-string]])
+
+(def FieldIndexMetadata
+  "Schema for a given result provided by [[metabase.driver/describe-indexes]]."
+  [:ref ::FieldIndexMetadata])
+
+(mr/def ::FieldMetadataEntry
+  (-> (mr/schema ::TableMetadataField)
+      (mut/assoc :table-schema [:maybe ::lib.schema.common/non-blank-string])
+      (mut/assoc :table-name   ::lib.schema.common/non-blank-string)))
+
+(def FieldMetadataEntry
+  "Schema for an item in the expected output of [[metabase.driver/describe-fields]]."
+  [:ref ::FieldMetadataEntry])
+
+;;; not actually used; leaving here for now because it serves as documentation
+(comment
+  (def NestedFCMetadata
+    "Schema for the expected output of [[metabase.driver.sql-jdbc.sync/describe-nested-field-columns]]."
+    [:maybe [:set TableMetadataField]]))
+
+(mr/def ::TableFKMetadataEntry
+  [:map
+   [:fk-column-name   ::lib.schema.common/non-blank-string]
+   [:dest-table       [:map
+                       [:name   ::lib.schema.common/non-blank-string]
+                       [:schema [:maybe ::lib.schema.common/non-blank-string]]]]
+   [:dest-column-name ::lib.schema.common/non-blank-string]])
+
+(def TableFKMetadataEntry
+  "Schema for an individual entry in `FKMetadata`."
+  [:ref ::TableFKMetadataEntry])
+
+(mr/def ::FKMetadataEntry
+  [:map {:closed true}
+   [:fk-table-name   ::lib.schema.common/non-blank-string]
+   [:fk-table-schema [:maybe ::lib.schema.common/non-blank-string]]
+   [:fk-column-name  ::lib.schema.common/non-blank-string]
+   [:pk-table-name   ::lib.schema.common/non-blank-string]
+   [:pk-table-schema [:maybe ::lib.schema.common/non-blank-string]]
+   [:pk-column-name  ::lib.schema.common/non-blank-string]])
 
 (def FKMetadataEntry
-  "Schema for an individual entry in `FKMetadata`."
-  {:fk-column-name   su/NonBlankString
-   :dest-table       {:name   su/NonBlankString
-                      :schema (s/maybe su/NonBlankString)}
-   :dest-column-name su/NonBlankString})
-
-(def FKMetadata
-  "Schema for the expected output of `describe-table-fks`."
-  (s/maybe #{FKMetadataEntry}))
-
-(def TimeZoneId
-  "Schema predicate ensuring a valid time zone string"
-  (s/pred (fn [tz-str]
-            (u/ignore-exceptions (time/time-zone-for-id tz-str)))
-          'time/time-zone-for-id))
+  "Schema for an entry in the expected output of [[metabase.driver/describe-fks]]."
+  [:ref ::FKMetadataEntry])
 
 ;; These schemas are provided purely as conveniences since adding `:import` statements to get the corresponding
 ;; classes from the model namespaces also requires a `:require`, which `clj-refactor` seems more than happy to strip
 ;; out from the ns declaration when running `cljr-clean-ns`. Plus as a bonus in the future we could add additional
 ;; validations to these, e.g. requiring that a Field have a base_type
 
-(def DatabaseInstance "Schema for a valid instance of a Metabase Database." (class Database))
-(def TableInstance    "Schema for a valid instance of a Metabase Table."    (class Table))
-(def FieldInstance    "Schema for a valid instance of a Metabase Field."    (class Field))
+(mr/def ::no-kebab-case-keys (ms/MapWithNoKebabKeys))
 
+(mr/def ::DatabaseInstance
+  [:ref ::lib.schema.metadata/database])
 
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                            SAMPLING & FINGERPRINTS                                             |
-;;; +----------------------------------------------------------------------------------------------------------------+
+(def DatabaseInstance
+  "Schema for the Lib metadata of a Database, the only form of a Database inside sync."
+  [:ref ::DatabaseInstance])
 
-(def FieldSample
-  "Schema for a sample of values returned by the `sample` sub-stage of analysis and passed into the `fingerprint`
-   stage. Guaranteed to be non-empty and non-nil."
-  ;; Validating against this is actually pretty quick, in the order of microseconds even for a 10,000 value sequence
-  (s/constrained [(s/pred (complement nil?))] seq "Non-empty sequence of non-nil values."))
+(mr/def ::TableInstance
+  [:and
+   (ms/InstanceOf :model/Table)
+   ::no-kebab-case-keys])
 
-(def TableSample
-  "Schema for a sample of values of certain Fields for a TABLE. This should basically just be a sequence of rows where
-   each row is a sequence of values in the same order as the Fields passed in (basically the format you get from JDBC
-   when `:as-arrays?` is `false`).
+(def TableInstance
+  "Schema for a valid instance of a Metabase Table."
+  [:ref ::TableInstance])
 
-   e.g. if Fields passed in were `ID` and `Name` the Table sample should look something like:
+(mr/def ::FieldInstance
+  [:and
+   [:and
+    (ms/InstanceOf :model/Field)
+    ::no-kebab-case-keys]])
 
-     [[1 \"Rasta Toucan\"]
-      [2 \"Lucky Pigeon\"]
-      [3 \"Kanye Nest\"]]"
-  [[s/Any]])
-
-
-(def GlobalFingerprint
-  "Fingerprint values that Fields of all types should have."
-  {(s/optional-key :distinct-count) s/Int})
-
-(def Percent
-  "Schema for something represting a percentage. A floating-point value between (inclusive) 0 and 1."
-  (s/constrained s/Num #(<= 0 % 1) "Valid percentage between (inclusive) 0 and 1."))
-
-(def NumberFingerprint
-  "Schema for fingerprint information for Fields deriving from `:type/Number`."
-  {(s/optional-key :min) s/Num
-   (s/optional-key :max) s/Num
-   (s/optional-key :avg) s/Num})
-
-(def TextFingerprint
-  "Schema for fingerprint information for Fields deriving from `:type/Text`."
-  {(s/optional-key :percent-json)   Percent
-   (s/optional-key :percent-url)    Percent
-   (s/optional-key :percent-email)  Percent
-   (s/optional-key :average-length) (s/constrained Double #(>= % 0) "Valid number greater than or equal to zero")})
-
-(def TypeSpecificFingerprint
-  "Schema for type-specific fingerprint information."
-  (s/constrained
-   {(s/optional-key :type/Number) NumberFingerprint
-    (s/optional-key :type/Text)   TextFingerprint}
-   (fn [m]
-     (= 1 (count (keys m))))
-   "Type-specific fingerprint with exactly one key"))
-
-(def Fingerprint
-  "Schema for a Field 'fingerprint' generated as part of the analysis stage. Used to power the 'classification'
-   sub-stage of analysis. Stored as the `fingerprint` column of Field."
-  {(s/optional-key :global)       GlobalFingerprint
-   (s/optional-key :type)         TypeSpecificFingerprint
-   (s/optional-key :experimental) {s/Keyword s/Any}})
-
+(def FieldInstance
+  "Schema for a valid instance of a Metabase Field."
+  [:ref ::FieldInstance])
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                             FINGERPRINT VERSIONING                                             |
@@ -148,11 +190,18 @@
 ;; v3 that includes new "global" fingerprint info, both the v2-fingerprinted numeric Fields and the v1-fingerprinted
 ;; textual Fields can be upgraded to v3.
 
-(def fingerprint-version->types-that-should-be-re-fingerprinted
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
+(def ^:dynamic *fingerprint-version->types-that-should-be-re-fingerprinted*
   "Map of fingerprint version to the set of Field base types that need to be upgraded to this version the next
    time we do analysis. The highest-numbered entry is considered the latest version of fingerprints."
-  {1 #{:type/*}})
+  {1 #{:type/*}
+   2 #{:type/Number}
+   3 #{:type/DateTime}
+   4 #{:type/*}
+   5 #{:type/Text}
+   6 #{:type/Number :type/Text :type/DateTime}})
 
-(def latest-fingerprint-version
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
+(def ^:dynamic ^Long *latest-fingerprint-version*
   "The newest (highest-numbered) version of our Field fingerprints."
-  (apply max (keys fingerprint-version->types-that-should-be-re-fingerprinted)))
+  (apply max (keys *fingerprint-version->types-that-should-be-re-fingerprinted*)))

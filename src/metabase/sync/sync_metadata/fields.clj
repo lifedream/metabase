@@ -1,318 +1,199 @@
 (ns metabase.sync.sync-metadata.fields
   "Logic for updating Metabase Field models from metadata fetched from a physical DB.
+
   The basic idea here is to look at the metadata we get from calling `describe-table` on a connected database, then
   construct an identical set of metadata from what we have about that Table in the Metabase DB. Then we iterate over
   both sets of Metadata and perform whatever steps are needed to make sure the things in the DB match the things that
-  came back from `describe-table`."
-  (:require [clojure.string :as str]
-            [clojure.tools.logging :as log]
-            [medley.core :as m]
-            [metabase.models
-             [field :as field :refer [Field]]
-             [humanization :as humanization]
-             [table :as table]]
-            [metabase.sync
-             [fetch-metadata :as fetch-metadata]
-             [interface :as i]
-             [util :as sync-util]]
-            [metabase.util :as u]
-            [metabase.util.schema :as su]
-            [schema.core :as s]
-            [toucan.db :as db]))
+  came back from `describe-table`. These steps are broken out into three main parts:
 
-(def ^:private ParentID (s/maybe su/IntGreaterThanZero))
+  * Fetch Our Metadata - logic is in `metabase.sync.sync-metadata.fields.our-metadata`. Construct a map of metadata from
+    the Metabase application database that matches the form of DB metadata about Fields in a Table. This metadata is
+    used to next two steps to determine what sync operations need to be performed by comparing the differences in the
+    two sets of Metadata.
 
-(def ^:private TableMetadataFieldWithID
-  "Schema for `TableMetadataField` with an included ID of the corresponding Metabase Field object.
-  `our-metadata` is always returned in this format. (The ID is needed in certain places so we know which Fields to
-  retire, and the parent ID of any nested-fields.)"
-  (assoc i/TableMetadataField
-    :id                             su/IntGreaterThanZero
-    (s/optional-key :nested-fields) #{(s/recursive #'TableMetadataFieldWithID)}))
+  * Sync Field instances -- logic is in `metabase.sync.sync-metadata.fields.sync-instances`. Make sure the `Field`
+    instances in the Metabase application database match up with those in the DB metadata, creating new Fields as
+    needed, and marking existing ones as active or inactive as appropriate.
 
-(def ^:private TableMetadataFieldWithOptionalID
-  "Schema for either `i/TableMetadataField` (`db-metadata`) or `TableMetadataFieldWithID` (`our-metadata`)."
-  (assoc i/TableMetadataField
-    (s/optional-key :id)            su/IntGreaterThanZero
-    (s/optional-key :nested-fields) #{(s/recursive #'TableMetadataFieldWithOptionalID)}))
+  * Update instance metadata -- logic is in `metabase.sync.sync-metadata.fields.sync-metadata`. Update metadata
+    properties of `Field` instances in the application database as needed -- this includes the base type, database type,
+    semantic type, and comment/remark (description) properties. This primarily affects Fields that were not newly
+    created; newly created Fields are given appropriate metadata when first synced (by `sync-instances`).
 
+  A note on terminology used in `metabase.sync.sync-metadata.fields.*` namespaces:
 
-(s/defn ^:private field-metadata-name-for-logging :- s/Str
-  "Return a 'name for logging' for a map that conforms to the `TableMetadataField` schema.
+  * `db-metadata` is a set of `field-metadata` maps coming back from the DB (e.g. from something like JDBC
+    `DatabaseMetaData`) describing the columns (or equivalent) currently present in the table (or equivalent) that we're
+    syncing.
 
-      (field-metadata-name-for-logging table field-metadata) ; -> \"Table 'venues' Field 'name'\""
-  [table :- i/TableInstance, field-metadata :- TableMetadataFieldWithOptionalID]
-  (format "%s Field '%s'" (sync-util/name-for-logging table) (:name field-metadata)))
+  *  `field-metadata` is a map of information describing a single column currently present in the table being synced
 
-(defn- canonical-name [field]
-  (str/lower-case (:name field)))
+  *  `our-metadata` is a set of maps of Field metadata reconstructed from the Metabase application database.
 
-(s/defn ^:private special-type [field :- (s/maybe i/TableMetadataField)]
-  (and field
-       (or (:special-type field)
-           (when (:pk? field) :type/PK))))
+  *  `metabase-field` is a single map of Field metadata reconstructed from the Metabase application database; there is
+     a 1:1 correspondence between this metadata and a row in the `Field` table. Unlike `field-metadata`, these entries
+     always have an `:id` associated with them (because they are present in the Metabase application DB).
 
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                         CREATING / REACTIVATING FIELDS                                         |
-;;; +----------------------------------------------------------------------------------------------------------------+
+  Other notes:
 
-(s/defn ^:private matching-inactive-fields :- (s/maybe [i/FieldInstance])
-  "Return an inactive metabase Field that matches NEW-FIELD-METADATA, if any such Field existis."
-  [table :- i/TableInstance, new-field-metadatas :- [i/TableMetadataField], parent-id :- ParentID]
-  (when (seq new-field-metadatas)
-    (db/select     Field
-      :table_id    (u/get-id table)
-      :%lower.name [:in (map canonical-name new-field-metadatas)]
-      :parent_id   parent-id
-      :active      false)))
-
-(s/defn ^:private insert-fields-if-needed! :- (s/maybe [s/Int])
-  [table :- i/TableInstance, new-fields :- [i/TableMetadataField], parent-id :- ParentID]
-  (when (seq new-fields)
-    (db/insert-many! Field
-      (for [{:keys [database-type base-type], field-name :name :as field} new-fields]
-        {:table_id      (u/get-id table)
-         :name          field-name
-         :display_name  (humanization/name->human-readable-name field-name)
-         :database_type database-type
-         :base_type     base-type
-         :special_type  (special-type field)
-         :parent_id     parent-id}))))
-
-(s/defn ^:private ->metabase-fields! :- [i/FieldInstance]
-  "Return an active Metabase Field instance that matches NEW-FIELD-METADATA. This object will be created or
-  reactivated as a side effect of calling this function."
-  [table :- i/TableInstance, new-field-metadata-chunk :- [i/TableMetadataField], parent-id :- ParentID]
-  (let [fields-to-reactivate (matching-inactive-fields table new-field-metadata-chunk parent-id)]
-
-    ;; if the field already exists but was just marked inactive then reäctivate it
-    (when (seq fields-to-reactivate)
-      (db/update-where! Field {:id [:in (map u/get-id fields-to-reactivate)]}
-        :active true))
-
-    (let [reactivated-pred (comp (set (map canonical-name fields-to-reactivate)) canonical-name)
-          ;; If we reactivated the fields, no need to insert them
-          new-field-ids (insert-fields-if-needed! table (remove reactivated-pred new-field-metadata-chunk) parent-id)]
-
-      ;; now return the Field in question
-      (when-let [new-and-updated-fields (seq (map u/get-id (concat fields-to-reactivate new-field-ids)))]
-        (db/select Field :id [:in new-and-updated-fields])))))
-
-(s/defn ^:private create-or-reactivate-field-chunk!
-  "Create (or reactivate) a Metabase Field object(s) for NEW-FIELD-METABASE and any nested fields."
-  [table :- i/TableInstance, new-field-metadata-chunk :- [i/TableMetadataField], parent-id :- ParentID]
-  ;; Create (or reactivate) the Metabase Field entry for NEW-FIELD-METADATA...
-  (let [updated-fields (->metabase-fields! table new-field-metadata-chunk parent-id)
-        name->updated-field (u/key-by canonical-name updated-fields)]
-    ;; ...then recursively do the same for any nested fields that belong to it.
-    (doseq [{nested-fields :nested-fields, :as new-field} new-field-metadata-chunk
-            :when (seq nested-fields)
-            :let [new-parent-id (u/get-id (get name->updated-field (canonical-name new-field)))]]
-      (create-or-reactivate-field-chunk! table (seq nested-fields) new-parent-id))))
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                            UPDATING FIELD TYPE INFO                                            |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(s/defn ^:private update-field-metadata-if-needed!
-  "Update the metadata for a Metabase Field as needed if any of the info coming back from the DB has changed."
-  [table :- i/TableInstance, metabase-field :- TableMetadataFieldWithID, field-metadata :- i/TableMetadataField]
-  (let [{old-database-type :database-type, old-base-type :base-type} metabase-field
-        {new-database-type :database-type, new-base-type :base-type} field-metadata]
-    ;; If the driver is reporting a different `database-type` than what we have recorded in the DB, update it
-    (when-not (= old-database-type new-database-type)
-      (log/info (format "Database type of %s has changed from '%s' to '%s'."
-                        (field-metadata-name-for-logging table metabase-field)
-                        old-database-type new-database-type))
-      (db/update! Field (u/get-id metabase-field), :database_type new-database-type))
-    ;; Now do the same for `base-type`
-    (when-not (= old-base-type new-base-type)
-      (log/info (format "Base type of %s has changed from '%s' to '%s'."
-                        (field-metadata-name-for-logging table metabase-field)
-                        old-base-type new-base-type))
-      (db/update! Field (u/get-id metabase-field), :base_type new-base-type))))
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                           "RETIRING" INACTIVE FIELDS                                           |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(s/defn ^:private retire-field!
-  "Mark an OLD-FIELD belonging to TABLE as inactive if corresponding Field object exists."
-  [table :- i/TableInstance, old-field :- TableMetadataFieldWithID]
-  (log/info (format "Marking %s as inactive." (field-metadata-name-for-logging table old-field)))
-  (db/update! Field (:id old-field)
-    :active false)
-  ;; Now recursively mark and nested fields as inactive
-  (doseq [nested-field (:nested-fields old-field)]
-    (retire-field! table nested-field)))
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                           SYNCING FIELDS IN DB (CREATING, REACTIVATING, OR RETIRING)                           |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(s/defn ^:private matching-field-metadata :- (s/maybe TableMetadataFieldWithOptionalID)
-  "Find Metadata that matches FIELD-METADATA from a set of OTHER-METADATA, if any exists."
-  [field-metadata :- TableMetadataFieldWithOptionalID, other-metadata :- #{TableMetadataFieldWithOptionalID}]
-  (some (fn [other-field-metadata]
-          (when (= (canonical-name field-metadata)
-                   (canonical-name other-field-metadata))
-              other-field-metadata))
-        other-metadata))
-
-(declare sync-field-instances!)
-
-(s/defn ^:private update-field-chunk!
-  [table :- i/TableInstance, known-fields :- {s/Str TableMetadataFieldWithID}, fields-to-update :- [i/TableMetadataField]]
-  (doseq [our-field fields-to-update
-          :let [db-field (get known-fields (canonical-name our-field))]]
-    ;; if field exists in both metadata sets then make sure the data recorded about the Field such as database_type is
-    ;; up-to-date...
-    (update-field-metadata-if-needed! table db-field our-field)
-    ;; ...and then recursively check the nested fields.
-    (when-let [db-nested-fields (seq (:nested-fields our-field))]
-      (sync-field-instances! table (set db-nested-fields) (:nested-fields db-field) (:id our-field)))))
-
-(s/defn ^:private sync-field-instances!
-  "Make sure the instances of Metabase Field are in-sync with the DB-METADATA."
-  [table :- i/TableInstance, db-metadata :- #{i/TableMetadataField}, our-metadata :- #{TableMetadataFieldWithID}
-   parent-id :- ParentID]
-  (let [known-fields (u/key-by canonical-name our-metadata)]
-    ;; Loop thru fields in DB-METADATA. Create/reactivate any fields that don't exist in OUR-METADATA.
-    (doseq [db-field-chunk (partition-all 1000 db-metadata)]
-      (sync-util/with-error-handling (format "Error checking if Fields '%s' needs to be created or reactivated"
-                                             (pr-str (map :name db-field-chunk)))
-        (let [known-field-pred (comp known-fields canonical-name)
-              fields-to-update (filter known-field-pred db-field-chunk)
-              new-fields       (remove known-field-pred db-field-chunk)]
-
-          (update-field-chunk! table known-fields fields-to-update)
-          ;; otherwise if field doesn't exist, create or reactivate it
-          (when (seq new-fields)
-            (create-or-reactivate-field-chunk! table new-fields parent-id))))))
-
-  ;; ok, loop thru Fields in OUR-METADATA. Mark Fields as inactive if they don't exist in DB-METADATA.
-  (doseq [our-field our-metadata]
-    (sync-util/with-error-handling (format "Error checking if '%s' needs to be retired" (:name our-field))
-      (if-let [db-field (matching-field-metadata our-field db-metadata)]
-        ;; if field exists in both metadata sets we just need to recursively check the nested fields
-        (when-let [our-nested-fields (seq (:nested-fields our-field))]
-          (sync-field-instances! table (:nested-fields db-field) (set our-nested-fields) (:id our-field)))
-        ;; otherwise if field exists in our metadata but not DB metadata time to make it inactive
-        (retire-field! table our-field)))))
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                            UPDATING FIELD METADATA                                             |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(s/defn ^:private update-metadata!
-  "Make sure things like PK status and base-type are in sync with what has come back from the DB."
-  [table :- i/TableInstance, db-metadata :- #{i/TableMetadataField}, parent-id :- ParentID]
-  (let [existing-fields         (db/select [Field :base_type :special_type :name :id]
-                                  :table_id  (u/get-id table)
-                                  :active    true
-                                  :parent_id parent-id)
-        field-name->db-metadata (u/key-by canonical-name db-metadata)]
-    ;; Make sure special types are up-to-date for all the fields
-    (doseq [field existing-fields
-            :let  [db-field         (get field-name->db-metadata (canonical-name field))
-                   new-special-type (special-type db-field)]
-            :when (and db-field
-                       (or
-                        ;; If the base_type has changed, we need to updated it
-                        (not= (:base_type field) (:base-type db-field))
-                        ;; If the base_type hasn't changed, but we now have a special_type, we should update it. We
-                        ;; should not overwrite a special_type that is already present (could have been specified by
-                        ;; the user).
-                        (and (not (:special_type field)) new-special-type)))]
-      ;; update special type if one came back from DB metadata but Field doesn't currently have one
-      (db/update! Field (u/get-id field)
-                  (merge {:base_type (:base-type db-field)}
-                         (when-not (:special_type field)
-                           {:special_type new-special-type})))
-      ;; now recursively do the same for any nested fields
-      (when-let [db-nested-fields (seq (:nested-fields db-field))]
-        (update-metadata! table (set db-nested-fields) (u/get-id field))))))
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                         FETCHING OUR CURRENT METADATA                                          |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(s/defn ^:private add-nested-fields :- TableMetadataFieldWithID
-  "Recursively add entries for any nested-fields to FIELD."
-  [field-metadata :- TableMetadataFieldWithID, parent-id->fields :- {ParentID #{TableMetadataFieldWithID}}]
-  (let [nested-fields (get parent-id->fields (u/get-id field-metadata))]
-    (if-not (seq nested-fields)
-      field-metadata
-      (assoc field-metadata :nested-fields (set (for [nested-field nested-fields]
-                                                  (add-nested-fields nested-field parent-id->fields)))))))
-
-(s/defn ^:private parent-id->fields :- {ParentID #{TableMetadataFieldWithID}}
-  "Build a map of the Metabase Fields we have for TABLE, keyed by their parent id (usually `nil`)."
-  [table :- i/TableInstance]
-  (->> (for [field (db/select [Field :name :database_type :base_type :special_type :parent_id :id]
-                     :table_id (u/get-id table)
-                     :active   true)]
-         {:parent-id     (:parent_id field)
-          :id            (:id field)
-          :name          (:name field)
-          :database-type (:database_type field)
-          :base-type     (:base_type field)
-          :special-type  (:special_type field)
-          :pk?           (isa? (:special_type field) :type/PK)})
-       ;; make a map of parent-id -> set of
-       (group-by :parent-id)
-       ;; remove the parent ID because the Metadata from `describe-table` won't have it. Save the results as a set
-       (m/map-vals (fn [fields]
-                     (set (for [field fields]
-                            (dissoc field :parent-id)))))))
-
-(s/defn ^:private our-metadata :- #{TableMetadataFieldWithID}
-  "Return information we have about Fields for a TABLE currently in the application database
-   in (almost) exactly the same `TableMetadataField` format returned by `describe-table`."
-  [table :- i/TableInstance]
-  ;; Fetch all the Fields for this TABLE. Then group them by their parent ID, which we'll use to construct our
-  ;; metadata in the correct format
-  (let [parent-id->fields (parent-id->fields table)]
-    ;; get all the top-level fields, then call `add-nested-fields` to recursively add the fields
-    (set (for [field (get parent-id->fields nil)]
-           (add-nested-fields field parent-id->fields)))))
-
-
-;;; +----------------------------------------------------------------------------------------------------------------+
-;;; |                                      FETCHING METADATA FROM CONNECTED DB                                       |
-;;; +----------------------------------------------------------------------------------------------------------------+
-
-(s/defn ^:private db-metadata :- #{i/TableMetadataField}
-  "Fetch metadata about Fields belonging to a given TABLE directly from an external database by calling its
-   driver's implementation of `describe-table`."
-  [database :- i/DatabaseInstance, table :- i/TableInstance]
-  (:fields (fetch-metadata/table-metadata database table)))
-
+  * In general the methods in these namespaces return the number of rows updated; these numbers are summed and used
+    for logging purposes by higher-level sync logic."
+  (:require
+   [metabase.dependencies.hooks :as dependencies.hooks]
+   [metabase.driver.settings :as driver.settings]
+   [metabase.driver.util :as driver.u]
+   [metabase.sync.db :as sync.db]
+   [metabase.sync.fetch-metadata :as fetch-metadata]
+   [metabase.sync.interface :as i]
+   [metabase.sync.sync-metadata.fields.our-metadata :as fields.our-metadata]
+   [metabase.sync.sync-metadata.fields.sync-instances :as sync-instances]
+   [metabase.sync.sync-metadata.fields.sync-metadata :as sync-metadata]
+   [metabase.sync.util :as sync-util]
+   [metabase.util.log :as log]
+   [metabase.util.malli :as mu]
+   [metabase.util.malli.schema :as ms]
+   [toucan2.util :as t2.util]))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                            PUTTING IT ALL TOGETHER                                             |
 ;;; +----------------------------------------------------------------------------------------------------------------+
 
-(s/defn sync-fields-for-table!
-  "Sync the Fields in the Metabase application database for a specific TABLE."
-  ([table :- i/TableInstance]
-   (sync-fields-for-table! (table/database table) table))
-  ([database :- i/DatabaseInstance, table :- i/TableInstance]
-   (sync-util/with-error-handling (format "Error syncing fields for %s" (sync-util/name-for-logging table))
-     (let [db-metadata (db-metadata database table)]
-       ;; make sure the instances of Field are in-sync
-       (sync-field-instances! table db-metadata (our-metadata table) nil)
-       ;; now that tables are synced and fields created as needed make sure field properties are in sync
-       (update-metadata! table db-metadata nil)))))
+(mu/defn- warn-too-many-fields!
+  "Log that `table`'s warehouse schema has more fields than sync-max-fields-per-table (`limit`), so only the first
+  `limit` (by name) are synced as :model/Field rows and the rest are skipped -- keeps document databases with very
+  large/dynamic schemas (e.g. MongoDB) from creating an unbounded number of Fields."
+  [table :- i/TableInstance
+   limit :- ms/PositiveInt]
+  (log/warnf (str "Table %s has more than sync-max-fields-per-table (%d) fields; syncing the first %d (by name) and "
+                  "skipping the rest. Raise MB_SYNC_MAX_FIELDS_PER_TABLE to sync more.")
+             (sync-util/name-for-logging table) limit limit))
 
+(mu/defn- limit-fields-to-sync :- [:set i/TableMetadataField]
+  "Cap `db-metadata` to at most [[driver.settings/sync-max-fields-per-table]] fields, keeping the first by name so the
+  selection is stable across syncs, and warning when fields are dropped.
 
-(s/defn sync-fields!
-  "Sync the Fields in the Metabase application database for all the Tables in a DATABASE."
+  Drivers hard-cap their metadata at exactly `limit` fields per table (they read `sync-max-fields-per-table`), so a
+  table that comes back with `limit` fields is assumed to have hit the cap -- warn. We only need to truncate when a
+  driver returned strictly more than `limit` (i.e. one that doesn't honor the cap)."
+  [table       :- i/TableInstance
+   db-metadata :- [:set i/TableMetadataField]]
+  (let [limit (driver.settings/sync-max-fields-per-table)
+        n     (count db-metadata)]
+    (when (>= n limit)
+      (warn-too-many-fields! table limit))
+    (if (> n limit)
+      (into #{} (take limit (sort-by :name db-metadata)))
+      db-metadata)))
+
+(mu/defn- sync-and-update! :- ms/IntGreaterThanOrEqualToZero
+  "Sync Field instances (i.e., rows in the Field table in the Metabase application DB) for a Table, and update metadata
+  properties (e.g. base type and comment/remark) as needed. Returns number of Fields synced. Only the first
+  [[driver.settings/sync-max-fields-per-table]] fields are synced; any beyond that are skipped (see
+  [[limit-fields-to-sync]])."
+  [database    :- i/DatabaseInstance
+   table       :- i/TableInstance
+   db-metadata :- [:set i/TableMetadataField]]
+  (let [db-metadata (limit-fields-to-sync table db-metadata)]
+    (dependencies.hooks/with-batched-marks
+      (+ (sync-instances/sync-instances! table db-metadata (fields.our-metadata/our-metadata table))
+         ;; Now that tables are synced and fields created as needed make sure field properties are in sync.
+         ;; Re-fetch our metadata because there might be some things that have changed after calling
+         ;; `sync-instances`
+         (sync-metadata/update-metadata! database table db-metadata (fields.our-metadata/our-metadata table))))))
+
+(defn- select-best-matching-name
+  "Returns a key function for use with [[sort-by]] that ranks items based on how closely their `:schema` and `:name` match the given target values.
+   Items with matching `:schema` and `:name` are prioritized, with exact matches ranked higher than non-exact matches."
+  [target-schema target-name]
+  (fn [item]
+    [(not= (:schema item) target-schema)
+     (not= (:name item) target-name)]))
+
+(mu/defn sync-fields! :- [:or
+                          [:map
+                           [:updated-fields ms/IntGreaterThanOrEqualToZero]
+                           [:total-fields   ms/IntGreaterThanOrEqualToZero]]
+                          (ms/InstanceOfClass Throwable)]
+  "Sync the Fields in the Metabase application database for all the Tables in a `database`.
+
+  `fields-metadata` is a *reducible* of per-column metadata, ordered so a table's columns are contiguous. It is passed
+  straight to `sync!` (never `(into [] ...)`-ed): `sync!`'s `partition-by` buffers only one table's columns at a time,
+  so memory stays bounded by the widest single table rather than the whole schema. A schema with a huge or churning
+  set of tables (e.g. BigQuery with thousands of ephemeral tables) would otherwise materialize every column at once
+  and OOM."
   [database :- i/DatabaseInstance]
-  (doseq [table (sync-util/db->sync-tables database)]
-    (sync-fields-for-table! database table)))
+  (sync-util/with-error-handling (format "Error syncing Fields for Database ''%s''" (sync-util/name-for-logging database))
+    (let [driver          (driver.u/database->driver database)
+          schemas?        (driver.u/supports? driver :schemas database)
+          sync-table-id?  (set (sync.db/sync-table-ids (:id database)))]
+      (letfn [(sync! [fields-metadata]
+                (transduce (comp
+                            (partition-by (juxt :table-name :table-schema))
+                            (map (fn [table-metadata]
+                                   (let [{:keys [table-name table-schema]} (first table-metadata)
+                                         ;; match over hidden Tables too, so a hidden Table's columns are never
+                                         ;; given to a visible Table whose name differs only in case
+                                         table   (let [best (->> (sync.db/active-tables-by-lower-name-and-schema
+                                                                  (:id database)
+                                                                  (t2.util/lower-case-en table-name)
+                                                                  (some-> table-schema t2.util/lower-case-en))
+                                                                 (sort-by (select-best-matching-name table-schema table-name))
+                                                                 first)]
+                                                   (when (sync-table-id? (:id best))
+                                                     best))
+                                         updated (if table
+                                                   (try
+                                                     ;; TODO: decouple nested field columns sync from field sync. This will allow
+                                                     ;; describe-fields to be used for field sync for databases with nested field columns
+                                                     ;; Also this should be a driver method, not a sql-jdbc.sync method
+                                                     (let [all-metadata (fetch-metadata/include-nested-fields-for-table
+                                                                         (set table-metadata)
+                                                                         database
+                                                                         table)]
+                                                       (sync-and-update! database table all-metadata))
+                                                     (catch Exception e
+                                                       ;; an unreachable warehouse fails every table: abort the step
+                                                       (when (sync-util/transient-exception? e)
+                                                         (throw e))
+                                                       ;; a missing grant or FDW user mapping is for the customer to
+                                                       ;; fix, not a Metabase bug
+                                                       (if (sync-util/customer-environment-exception? e)
+                                                         (log/warnf "Error syncing Fields for %s: %s"
+                                                                    (sync-util/name-for-logging table) (ex-message e))
+                                                         (log/errorf e "Error syncing Fields for %s: %s"
+                                                                     (sync-util/name-for-logging table) (ex-message e)))
+                                                       0))
+                                                   0)]
+                                     {:total-fields   (count table-metadata)
+                                      :updated-fields updated}))))
+                           (partial merge-with +)
+                           {:total-fields   0
+                            :updated-fields 0}
+                           fields-metadata))]
+        (if schemas?
+          (transduce (comp
+                      (map (fn [schema]
+                             (log/infof "Fetching field metadata for %s.%s" (:name database) schema)
+                             (fetch-metadata/fields-metadata database :schema-names [schema])))
+                      (map sync!))
+                     (completing (partial merge-with +))
+                     {:total-fields   0
+                      :updated-fields 0}
+                     (sync-util/sync-schemas database))
+          (sync! (fetch-metadata/fields-metadata database)))))))
+
+(mu/defn sync-fields-for-table!
+  "Sync the Fields in the Metabase application database for a specific `table`."
+  ([table :- i/TableInstance]
+   (sync-fields-for-table! (driver.u/lib-database (:db_id table)) table))
+
+  ([database :- i/DatabaseInstance
+    table    :- i/TableInstance]
+   (sync-util/with-error-handling (format "Error syncing Fields for Table ''%s''" (sync-util/name-for-logging table))
+     (let [db-metadata (fetch-metadata/table-fields-metadata database table)
+           ;; TODO: decouple nested field columns sync from field sync. This will allow
+           ;; describe-fields to be used for field sync for databases with nested field columns
+           ;; Also this should be a driver method, not a sql-jdbc.sync method
+           db-metadata (fetch-metadata/include-nested-fields-for-table db-metadata database table)]
+       {:total-fields   (count db-metadata)
+        :updated-fields (sync-and-update! database table db-metadata)}))))

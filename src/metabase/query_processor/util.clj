@@ -1,124 +1,140 @@
 (ns metabase.query-processor.util
   "Utility functions used by the global query processor and middleware functions."
-  (:require [buddy.core
-             [codecs :as codecs]
-             [hash :as hash]]
-            [cheshire.core :as json]
-            [clojure.string :as str]
-            [metabase.util :as u]
-            [metabase.util.schema :as su]
-            [schema.core :as s]))
+  (:refer-clojure :exclude [select-keys get-in])
+  (:require
+   [buddy.core.codecs :as codecs]
+   [clojure.string :as str]
+   [metabase.driver :as driver]
+   [metabase.lib-be.core]
+   [metabase.lib.core :as lib]
+   [metabase.query-processor.schema :as qp.schema]
+   [metabase.system.core :as system]
+   [metabase.util :as u]
+   [metabase.util.malli :as mu]
+   [metabase.util.performance :refer [select-keys get-in]]
+   [potemkin :as p]))
 
-(defn mbql-query?
-  "Is the given query an MBQL query?"
-  [query]
-  (= :query (keyword (:type query))))
+(set! *warn-on-reflection* true)
 
-(defn datetime-field?
-  "Is FIELD a `DateTime` field?"
-  [{:keys [base-type special-type]}]
-  (or (isa? base-type :type/DateTime)
-      (isa? special-type :type/DateTime)))
+(comment metabase.lib-be.core/keep-me)
 
-(defn query-without-aggregations-or-limits?
-  "Is the given query an MBQL query without a `:limit`, `:aggregation`, or `:page` clause?"
-  [{{aggregations :aggregation, :keys [limit page]} :query}]
-  (and (not limit)
-       (not page)
-       (or (empty? aggregations)
-           (= (:aggregation-type (first aggregations)) :rows))))
+(p/import-vars
+ [metabase.lib-be.core
+  query-hash])
 
-(defn query->remark
-  "Generate an approparite REMARK to be prepended to a query to give DBAs additional information about the query being
-  executed. See documentation for `mbql->native` and [issue #2386](https://github.com/metabase/metabase/issues/2386)
-  for more information."  ^String [{{:keys [executed-by query-hash query-type], :as info} :info}]
-  (str "Metabase" (when info
-                    (assert (instance? (Class/forName "[B") query-hash))
-                    (format ":: userID: %s queryType: %s queryHash: %s"
-                            executed-by query-type (codecs/bytes->hex query-hash)))))
+;; TODO - I think most of the functions in this namespace that we don't remove could be moved
+;; to [[metabase.legacy-mbql.util]]
 
+(defn- remark-field
+  [field-name value]
+  (when-let [value (cond-> value (keyword? value) name)]
+    (format " %s: %s" field-name value)))
 
-;;; ------------------------------------------------- Normalization --------------------------------------------------
+(mu/defn query->remark-data
+  "Returns the data for a query remark as a map. Drivers can format this data as their database requires."
+  [{{:keys [executed-by query-hash card-id dashboard-id pulse-id context], :as _info} :info
+    database-id :database
+    :as query} :- ::qp.schema/any-query]
+  {:user-id      executed-by
+   :query-type   (if (:lib/type query)
+                   (case (keyword (:lib/type (lib/query-stage query -1)))
+                     :mbql.stage/mbql   "MBQL"
+                     :mbql.stage/native "native")
+                   (case (keyword (:type query))
+                     :query  "MBQL"
+                     :native "native"))
+   :query-hash   (when (bytes? query-hash) (codecs/bytes->hex query-hash))
+   :account-id   (system/site-uuid)
+   :dashboard-id dashboard-id
+   :card-id      card-id
+   :pulse-id     pulse-id
+   :context      context
+   :database-id  database-id})
 
-;; The following functions make it easier to deal with MBQL queries, which are case-insensitive, string/keyword
-;; insensitive, and underscore/hyphen insensitive.  These should be preferred instead of assuming the frontend will
-;; always pass in clauses the same way, since different variation are all legal under MBQL '98.
+(mu/defn default-query->remark
+  "Generates the default query remark. Exists as a separate function so that overrides of the query->remark multimethod
+   can access the default value."
+  [query :- ::qp.schema/any-query]
+  (let [{:keys [user-id query-type query-hash account-id dashboard-id card-id pulse-id context database-id]}
+        (query->remark-data query)]
+    (str "Metabase" (when user-id
+                      (assert query-hash "If info includes executed-by it should also include query-hash")
+                      (format ":: userID: %s queryType: %s queryHash: %s" user-id query-type query-hash))
+         (remark-field "accountID" account-id)
+         (remark-field "dashboardID" dashboard-id)
+         (remark-field "cardID" card-id)
+         (remark-field "pulseID" pulse-id)
+         (remark-field "context" context)
+         (remark-field "databaseID" database-id))))
 
-;; TODO - In the future it might make sense to simply walk the entire query and normalize the whole thing when it
-;; comes in. I've tried implementing middleware to do that but it ended up breaking a few things that wrongly assume
-;; different clauses will always use a certain case (e.g. SQL `:template_tags`). Fixing all of that is out-of-scope
-;; for the nested queries PR but should possibly be revisited in the future.
+(defmulti query->remark
+  "Generate an appropriate remark `^String` to be prepended to a query to give DBAs additional information about the query
+  being executed. See documentation for [[metabase.driver/mbql->native]] and #2386.
+  for more information.
 
-(s/defn normalize-token :- s/Keyword
+  So this turns your average 10, 20, 30 character query into a 110, 120, 130 etc character query.
+  One leaky-abstraction part of this is that this will confuse the bejeezus out of
+  people who first encounter their passed-through RDBMS error messages.
+
+  'Hey, this is a 20 character query! What's it talking about, error at position 120?'
+  This gets fixed, but in a spooky-action-at-a-distance way, in
+  `frontend/src/metabase/query_builder/components/VisualizationError.jsx`"
+  {:arglists '(^String [driver query])}
+  driver/dispatch-on-initialized-driver
+  :hierarchy #'driver/hierarchy)
+
+(defmethod query->remark :default
+  [_ query]
+  (default-query->remark query))
+
+;; TODO - this has been moved to `metabase.legacy-mbql.util`; use that implementation instead.
+(mu/defn ^:deprecated normalize-token :- :keyword
   "Convert a string or keyword in various cases (`lisp-case`, `snake_case`, or `SCREAMING_SNAKE_CASE`) to a lisp-cased
   keyword."
-  [token :- su/KeywordOrString]
+  [token :- [:or :keyword :string]]
   (-> (name token)
-      str/lower-case
+      u/lower-case-en
       (str/replace #"_" "-")
       keyword))
 
-(defn get-normalized
-  "Get the value for normalized key K in map M, regardless of how the key was specified in M,
-   whether string or keyword, lisp-case, snake_case, or SCREAMING_SNAKE_CASE.
+(def ^:private ^{:deprecated "0.57.0"} preserved-keys
+  "Keys that can survive merging metadata from the database onto metadata computed from the query. When merging
+  metadata, the types returned should be authoritative. But things like semantic_type, display_name, and description
+  can be merged on top."
+  ;; TODO: ideally we don't preserve :id but some notion of :user-entered-id or :identified-id
+  [:id :description :display_name :semantic_type
+   :fk_target_field_id :settings :visibility_type])
 
-     (get-normalized {\"NUM_TOUCANS\" 2} :num-toucans) ; -> 2"
-  ([m k]
-   {:pre [(or (u/maybe? map? m)
-              (println "Not a map:" m))]}
-   (let [k (normalize-token k)]
-     (some (fn [[map-k v]]
-             (when (= k (normalize-token map-k))
-               v))
-           m)))
-  ([m k not-found]
-   (or (get-normalized m k)
-       not-found)))
+(defn combine-metadata
+  "Blend saved metadata from previous runs into fresh metadata from an actual run of the query.
 
-(defn get-in-normalized
-  "Like `get-normalized`, but accepts a sequence of keys KS, like `get-in`.
+  Ensure that saved metadata from datasets or source queries can remain in the results metadata. We always recompute
+  metadata in general, so need to blend the saved metadata on top of the computed metadata. First argument should be
+  the metadata from a run from the query, and `old-metadata` should be the metadata from the database we wish to
+  ensure survives."
+  {:deprecated "0.57.0"}
+  [new-metadata old-metadata]
+  ;; deprecated fn using its own deprecated helper; both leave together
+  #_{:clj-kondo/ignore [:deprecated-var]}
+  (map (fn [new-col old-col]
+         (cond-> new-col
+           old-col (merge (select-keys old-col preserved-keys))))
+       new-metadata
+       (lib/match-returned-columns old-metadata new-metadata)))
 
-    (get-in-normalized {\"NUM_BIRDS\" {\"TOUCANS\" 2}} [:num-birds :toucans]) ; -> 2"
-  ([m ks]
-   {:pre [(u/maybe? sequential? ks)]}
-   (loop [m m, [k & more] ks]
-     (if-not k
-       m
-       (recur (get-normalized m k) more))))
-  ([m ks not-found]
-   (or (get-in-normalized m ks)
-       not-found)))
+#_{:clj-kondo/ignore [:metabase/discourage-dynamic-vars]}
+(def ^:dynamic *execute-async?*
+  "Whether to save QueryExecutions (and other post-execution side effects) asynchronously via the batch-processing
+  queue. Bind (or redef, when the query runs on another thread) to `false` in tests to save synchronously on the
+  calling thread."
+  true)
 
-(defn dissoc-normalized
-  "Remove all matching keys from map M regardless of case, string/keyword, or hypens/underscores.
+(mu/defn userland-query? :- :boolean
+  "Returns true if the query is an userland query, else false."
+  [query :- ::qp.schema/any-query]
+  (boolean (get-in query [:middleware :userland-query?])))
 
-     (dissoc-normalized {\"NUM_TOUCANS\" 3} :num-toucans) ; -> {}"
-  [m k]
-  {:pre [(or (u/maybe? map? m)
-             (println "Not a map:" m))]}
-  (let [k (normalize-token k)]
-    (loop [m m, [map-k & more, :as ks] (keys m)]
-      (cond
-        (not (seq ks)) m
-        (= k (normalize-token map-k)) (recur (dissoc m map-k) more)
-        :else                         (recur m                more)))))
-
-
-;;; ---------------------------------------------------- Hashing -----------------------------------------------------
-
-(defn- select-keys-for-hashing
-  "Return QUERY with only the keys relevant to hashing kept.
-  (This is done so irrelevant info or options that don't affect query results doesn't result in the same query
-  producing different hashes.)"
-  [query]
-  {:pre [(map? query)]}
-  (let [{:keys [constraints parameters], :as query} (select-keys query [:database :type :query :native :parameters
-                                                                        :constraints])]
-    (cond-> query
-      (empty? constraints) (dissoc :constraints)
-      (empty? parameters)  (dissoc :parameters))))
-
-(defn query-hash
-  "Return a 256-bit SHA3 hash of QUERY as a key for the cache. (This is returned as a byte array.)"
-  [query]
-  (hash/sha3-256 (json/generate-string (select-keys-for-hashing query))))
+(mu/defn internal-query? :- :boolean
+  "Returns `true` if query is an internal query."
+  [{query-type :type} :- ::qp.schema/any-query]
+  (= :internal (keyword query-type)))
